@@ -2241,7 +2241,7 @@ pub async fn whatsapp_qr_start() -> impl IntoResponse {
         return Json(serde_json::json!({
             "available": false,
             "message": "WhatsApp Web gateway not running. Start the gateway or use Business API mode.",
-            "help": "Run: npx openfang-whatsapp-gateway   (or set WHATSAPP_WEB_GATEWAY_URL)"
+            "help": "The WhatsApp Web gateway auto-starts with the daemon when configured. Ensure Node.js >= 18 is installed and WhatsApp is configured in config.toml. Set WHATSAPP_WEB_GATEWAY_URL to use an external gateway."
         }));
     }
 
@@ -5360,7 +5360,7 @@ pub async fn add_custom_model(
     if !catalog.add_custom_model(entry) {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("Model '{}' already exists", id)})),
+            Json(serde_json::json!({"error": format!("Model '{}' already exists for provider '{}'", id, provider)})),
         );
     }
 
