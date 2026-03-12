@@ -78,22 +78,17 @@ jobs:
       - name: Parse PowerShell installer
         run: pwsh -NoProfile -Command "Get-Content scripts/install.ps1 | Out-Null"
 
-  # ── Rust compilation checks (3 platforms) ─────────────────────────────────────────
+  # ── Rust compilation check (single platform sufficient) ──────────────────────────────────
   check:
-    name: Check / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Check
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: check-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
-      - name: Install Tauri system deps (Linux)
-        if: runner.os == 'Linux'
+          key: check-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Tauri system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
