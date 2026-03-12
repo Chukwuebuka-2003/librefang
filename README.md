@@ -25,6 +25,12 @@
   <img src="https://img.shields.io/badge/cli-librefang-informational?style=flat-square" alt="CLI librefang" />
 </p>
 
+<p align="center">
+  <a href="https://star-history.com/#librefang/librefang">
+    <img src="https://api.star-history.com/svg?repos=librefang/librefang&type=date" width="500" alt="Star History" />
+  </a>
+</p>
+
 ---
 
 > **LibreFang is a community-maintained fork of [`RightNow-AI/openfang`](https://github.com/RightNow-AI/openfang).**
