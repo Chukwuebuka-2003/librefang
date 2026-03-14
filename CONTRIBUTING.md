@@ -20,6 +20,7 @@ This guide covers everything you need to get started, from setting up your devel
 - [How to Add a New Channel Adapter](#how-to-add-a-new-channel-adapter)
 - [How to Add a New LLM Provider](#how-to-add-a-new-llm-provider)
 - [How to Add a New Tool](#how-to-add-a-new-tool)
+- [How to Write Integration Tests](#how-to-write-integration-tests)
 - [Pull Request Process](#pull-request-process)
 - [Code of Conduct](#code-of-conduct)
 
@@ -504,6 +505,141 @@ tools = ["my_tool"]
 5. Write tests for the tool function.
 
 6. If the tool requires kernel access (e.g., inter-agent communication), accept `Option<&Arc<dyn KernelHandle>>` and handle the `None` case gracefully.
+
+---
+
+## How to Write Integration Tests
+
+LibreFang has 2,100+ tests covering all crates. Every new feature must include tests. This section explains where tests live, how to structure them, and how to run them.
+
+### Where Tests Live
+
+Tests in LibreFang are **inline** — they live alongside the source code in `#[cfg(test)]` modules at the bottom of each `.rs` file:
+
+```
+crates/librefang-kernel/src/metering.rs     # contains #[cfg(test)] mod tests { ... }
+crates/librefang-memory/src/substrate.rs    # contains #[cfg(test)] mod tests { ... }
+crates/librefang-runtime/src/retry.rs       # contains #[cfg(test)] mod tests { ... }
+```
+
+This is the standard Rust convention and keeps tests close to the code they verify.
+
+### Naming Conventions
+
+- Test module: `#[cfg(test)] mod tests { ... }` at the bottom of the file.
+- Test functions: `test_<what_is_being_tested>` in `snake_case`.
+  - Good: `test_record_and_check_quota_under`, `test_substrate_kv`, `test_retry_config_defaults`
+  - Avoid: `test1`, `it_works`, `my_test`
+
+### How to Structure a Test
+
+Follow the **setup / action / assertion** pattern:
+
+1. **Setup** — create the dependencies your code needs (in-memory databases, config structs, etc.).
+2. **Action** — call the function or method under test.
+3. **Assertion** — verify the result with `assert!`, `assert_eq!`, or pattern matching.
+
+Many crates provide helpers for setup. For example, `MemorySubstrate::open_in_memory(0.1)` creates an in-memory SQLite database, and `MeteringEngine` tests use a shared `setup()` function.
+
+### How to Run Tests
+
+**All tests in the workspace:**
+
+```bash
+cargo test --workspace
+```
+
+**Tests for a specific crate:**
+
+```bash
+cargo test -p librefang-kernel
+cargo test -p librefang-memory
+cargo test -p librefang-runtime
+```
+
+**A single test by name:**
+
+```bash
+cargo test -p librefang-kernel test_record_and_check_quota_under
+```
+
+**Show output from passing tests (useful for debugging):**
+
+```bash
+cargo test -p librefang-memory -- --nocapture
+```
+
+### Test Skeleton
+
+#### Synchronous test
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_my_feature() {
+        // Setup
+        let config = MyConfig::default();
+
+        // Action
+        let result = config.validate();
+
+        // Assertion
+        assert!(result.is_ok());
+    }
+}
+```
+
+#### Async test (requires `tokio`)
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_my_async_feature() {
+        // Setup
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+
+        // Action
+        substrate
+            .set(agent_id, "key", serde_json::json!("value"))
+            .await
+            .unwrap();
+        let val = substrate.get(agent_id, "key").await.unwrap();
+
+        // Assertion
+        assert_eq!(val, Some(serde_json::json!("value")));
+    }
+}
+```
+
+### Tips
+
+- **Use `#[tokio::test]`** for any test that calls `.await`. Most crates in LibreFang already depend on `tokio` with the `test-util` feature.
+- **Use in-memory databases** for isolation. `MemorySubstrate::open_in_memory(0.1)` avoids touching the real filesystem.
+- **Use `tempfile::TempDir`** when you need a real directory (e.g., skill loading, file I/O tests). The directory is automatically cleaned up when the `TempDir` value is dropped.
+- **Use `Default::default()`** to construct config structs with sensible defaults, then override only the fields relevant to your test.
+- **Skip tests that need external services** by checking for environment variables:
+  ```rust
+  #[tokio::test]
+  async fn test_llm_integration() {
+      let api_key = match std::env::var("GROQ_API_KEY") {
+          Ok(k) => k,
+          Err(_) => {
+              eprintln!("Skipping: GROQ_API_KEY not set");
+              return;
+          }
+      };
+      // ... test with real API
+  }
+  ```
+- **Extract a `setup()` helper** when multiple tests in the same module need the same boilerplate (see `crates/librefang-kernel/src/metering.rs` for an example).
+- **Test error cases too** — verify that invalid input returns the expected error, not just that the happy path works.
 
 ---
 
