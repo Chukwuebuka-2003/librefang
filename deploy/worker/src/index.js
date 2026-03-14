@@ -375,6 +375,14 @@ const HTML = `<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="card" style="text-align:center;">
+      <div style="color:var(--dim);font-size:0.85rem;margin-bottom:12px;">Or deploy from your terminal:</div>
+      <div style="background:#0d0d14;border:1px solid var(--border);border-radius:10px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;overflow-x:auto;">
+        <code style="color:var(--green);white-space:nowrap;font-size:0.85rem;"><span style="color:var(--dim);user-select:none;">$ </span>curl -sL https://raw.githubusercontent.com/librefang/librefang/main/deploy/fly/deploy.sh | bash</code>
+        <button onclick="copyCmd(this)" style="background:var(--accent);color:white;border:none;border-radius:8px;padding:6px 14px;font-size:0.8rem;cursor:pointer;white-space:nowrap;flex-shrink:0;">Copy</button>
+      </div>
+    </div>
+
     <div class="result" id="result">
       <div class="result-success">
         <h2>Deployed!</h2>
@@ -386,6 +394,33 @@ const HTML = `<!DOCTYPE html>
         <a class="result-link secondary" id="flyLink" href="#" target="_blank">Fly.io Console</a>
         <div class="result-info" id="resultInfo"></div>
       </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:12px;">Troubleshooting</div>
+      <details style="margin-bottom:8px;">
+        <summary style="color:var(--dim);font-size:0.85rem;cursor:pointer;">Cannot create Personal Access Token (SSO error)</summary>
+        <div style="color:var(--dim);font-size:0.85rem;line-height:1.6;padding:8px 0 0 16px;">
+          If you see: <em>"Access Tokens cannot be created because an organization requires SSO"</em><br>
+          Use a per-org token instead. Run in your terminal:<br>
+          <code style="color:var(--green);background:var(--bg);padding:2px 6px;border-radius:4px;">flyctl tokens org &lt;your-org-name&gt;</code><br>
+          Then paste the generated token above.
+        </div>
+      </details>
+      <details style="margin-bottom:8px;">
+        <summary style="color:var(--dim);font-size:0.85rem;cursor:pointer;">Deploy failed: image not found</summary>
+        <div style="color:var(--dim);font-size:0.85rem;line-height:1.6;padding:8px 0 0 16px;">
+          The Docker image <code style="color:var(--green);">ghcr.io/librefang/librefang:latest</code> is built on each release.<br>
+          If no release has been published yet, use the terminal deploy script above &mdash; it builds from source.
+        </div>
+      </details>
+      <details>
+        <summary style="color:var(--dim);font-size:0.85rem;cursor:pointer;">How to add or change LLM provider after deploy?</summary>
+        <div style="color:var(--dim);font-size:0.85rem;line-height:1.6;padding:8px 0 0 16px;">
+          <code style="color:var(--green);background:var(--bg);padding:2px 6px;border-radius:4px;">flyctl secrets set OPENAI_API_KEY=sk-... --app your-app-name</code><br>
+          Then edit <code style="color:var(--green);">/data/config.toml</code> via <code style="color:var(--green);">flyctl ssh console</code> to update the default model.
+        </div>
+      </details>
     </div>
 
     <div class="footer">
@@ -474,6 +509,14 @@ const HTML = `<!DOCTYPE html>
       const el = document.getElementById(id);
       el.classList.remove('active', 'done');
       el.querySelector('.icon').textContent = '';
+    }
+    function copyCmd(btn) {
+      navigator.clipboard.writeText("curl -sL https://raw.githubusercontent.com/librefang/librefang/main/deploy/fly/deploy.sh | bash").then(() => {
+        btn.textContent = "Copied!";
+        btn.style.background = "var(--green)";
+        btn.style.color = "#0a0a0f";
+        setTimeout(() => { btn.textContent = "Copy"; btn.style.background = "var(--accent)"; btn.style.color = "white"; }, 2000);
+      });
     }
     function showError(msg) {
       const el = document.getElementById('error');
