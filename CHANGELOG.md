@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add stable_prefix_mode for cache-friendly prompts (#427) (@houko)
 - Replace native-tls with rustls for IMAP channel (#432) (@houko)
 - Add API endpoint versioning support (#450) (@houko)
+- Generate versioned homebrew formula on release (#503) (@houko)
 
 ### Fixed
 
@@ -28,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update nix flake for nixpkgs darwin SDK migration (#491) (@houko)
 - Update nix flake for darwin SDK and crane warnings (#493) (@houko)
 - Add git to devShell and preserve user PATH (#494) (@houko)
+- Remove duplicate `/api/versions` route causing panic on startup (#501) (@houko)
+- Use Render API for heartbeat + release script improvements (#504) (@houko)
+- Allow re-release by replacing existing changelog entry (#505) (@houko)
 
 ### Documentation
 
@@ -36,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - V0.4.7-20260315 (#486) (@houko)
+- V0.5.0-20260316 (#499) (@houko)
+
 
 ## [0.4.7] - 2026-03-15
 
