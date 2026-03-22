@@ -4087,6 +4087,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "librefang-testing"
+version = "2026.3.2201"
+dependencies = [
+ "async-trait",
+ "axum",
+ "dashmap",
+ "http-body-util",
+ "librefang-api",
+ "librefang-channels",
+ "librefang-extensions",
+ "librefang-hands",
+ "librefang-kernel",
+ "librefang-memory",
+ "librefang-runtime",
+ "librefang-skills",
+ "librefang-types",
+ "librefang-wire",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "librefang-types"
 version = "2026.3.2201"
 dependencies = [

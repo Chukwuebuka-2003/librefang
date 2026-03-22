@@ -15,6 +15,7 @@ members = [
     "crates/librefang-hands",
     "crates/librefang-extensions",
     "xtask",
+    "crates/librefang-testing",
 ]
 
 [workspace.package]

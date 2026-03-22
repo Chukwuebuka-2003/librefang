@@ -1,0 +1,32 @@
+[package]
+name = "librefang-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "测试基础设施：提供 mock kernel、mock LLM driver 和 API 路由测试工具"
+
+[dependencies]
+librefang-types = { path = "../librefang-types" }
+librefang-kernel = { path = "../librefang-kernel" }
+librefang-runtime = { path = "../librefang-runtime" }
+librefang-memory = { path = "../librefang-memory" }
+librefang-api = { path = "../librefang-api", default-features = false }
+librefang-wire = { path = "../librefang-wire" }
+librefang-channels = { path = "../librefang-channels" }
+librefang-skills = { path = "../librefang-skills" }
+librefang-hands = { path = "../librefang-hands" }
+librefang-extensions = { path = "../librefang-extensions" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
