@@ -6,4 +6,4 @@
 pub mod config;
 pub mod metrics;
 
-pub use metrics::{normalize_path, record_http_request, get_http_metrics_summary};
+pub use metrics::{get_http_metrics_summary, normalize_path, record_http_request};

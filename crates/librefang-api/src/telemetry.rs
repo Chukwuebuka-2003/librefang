@@ -22,7 +22,9 @@ static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Returns the handle for rendering metrics output.
 pub fn init_prometheus() -> PrometheusHandle {
     let builder = PrometheusBuilder::new();
-    builder.install_recorder().expect("failed to install prometheus recorder")
+    builder
+        .install_recorder()
+        .expect("failed to install prometheus recorder")
 }
 
 /// Get the global Prometheus handle (if initialized).

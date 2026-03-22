@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Maximum iterations in the agent loop before giving up.
 const MAX_ITERATIONS: u32 = 50;
