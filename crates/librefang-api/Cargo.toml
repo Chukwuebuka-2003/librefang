@@ -57,7 +57,6 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
 default = ["all-channels", "telemetry"]
-telemetry = []
 
 # OpenTelemetry tracing export + Prometheus metrics
 telemetry = [

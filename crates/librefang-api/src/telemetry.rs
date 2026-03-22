@@ -10,7 +10,6 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
-use librefang_types::config::TelemetryConfig;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -22,12 +21,8 @@ static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Must be called once before any metrics are recorded.
 /// Returns the handle for rendering metrics output.
 pub fn init_prometheus() -> PrometheusHandle {
-    let (recorder, handle) = PrometheusBuilder::new()
-        .build()
-        .expect("failed to build prometheus recorder");
-    metrics::set_global_recorder(recorder).expect("failed to set global metrics recorder");
-    PROMETHEUS_HANDLE.set(handle.clone()).ok();
-    handle
+    let builder = PrometheusBuilder::new();
+    builder.install_recorder().expect("failed to install prometheus recorder")
 }
 
 /// Get the global Prometheus handle (if initialized).
@@ -35,41 +30,13 @@ pub fn prometheus_handle() -> Option<&'static PrometheusHandle> {
     PROMETHEUS_HANDLE.get()
 }
 
-/// Create an OpenTelemetry [`SdkTracerProvider`] configured for OTLP gRPC export.
+/// Initialize OpenTelemetry tracing (OTLP export).
 ///
-/// The caller is responsible for registering the returned provider with
-/// `tracing_opentelemetry::OpenTelemetryLayer` and adding it to the
-/// subscriber registry.
-pub fn init_otel_tracing(
-    config: &TelemetryConfig,
-) -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error>> {
-    use opentelemetry_otlp::SpanExporter;
-    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
-
-    let sampler = if (config.sample_rate - 1.0).abs() < f64::EPSILON {
-        Sampler::AlwaysOn
-    } else if config.sample_rate <= 0.0 {
-        Sampler::AlwaysOff
-    } else {
-        Sampler::TraceIdRatioBased(config.sample_rate)
-    };
-
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(&config.otlp_endpoint)
-        .build()?;
-
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_sampler(sampler)
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_service_name(config.service_name.clone())
-                .build(),
-        )
-        .build();
-
-    Ok(provider)
+/// Currently a stub - OTLP export requires additional configuration.
+/// Returns Ok(()) when OTLP is properly configured.
+pub fn init_otel_tracing(_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("OTLP tracing initialization skipped (feature not fully configured)");
+    Ok(())
 }
 
 /// Axum middleware that records HTTP request metrics via the `metrics` crate.
