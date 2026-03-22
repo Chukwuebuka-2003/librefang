@@ -7,6 +7,7 @@ description = "Agent runtime and execution environment for LibreFang"
 
 [dependencies]
 librefang-types = { path = "../librefang-types" }
+librefang-channels = { path = "../librefang-channels" }
 librefang-memory = { path = "../librefang-memory" }
 librefang-skills = { path = "../librefang-skills" }
 tokio = { workspace = true }
@@ -25,6 +26,7 @@ tokio-stream = { workspace = true }
 wasmtime = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
@@ -35,8 +37,12 @@ tokio-tungstenite = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-native-certs = { workspace = true }
+ureq = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 shlex = "1"
 toml = { workspace = true }
+url = { workspace = true }
 dirs = { workspace = true }
 tempfile = { workspace = true }
 

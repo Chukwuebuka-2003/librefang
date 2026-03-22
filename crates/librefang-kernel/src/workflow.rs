@@ -12,6 +12,7 @@
 
 use chrono::{DateTime, Utc};
 use librefang_types::agent::AgentId;
+use librefang_types::subagent::SubagentContext;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -105,6 +106,17 @@ pub struct WorkflowStep {
     /// Optional variable name to store this step's output in.
     #[serde(default)]
     pub output_var: Option<String>,
+    /// Whether to inject parent workflow context into this step's prompt.
+    /// Default is `None`, which defers to the agent's `inherit_parent_context`
+    /// setting. Set to `Some(false)` to force disable context injection for
+    /// this step regardless of agent config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_context: Option<bool>,
+    /// Names of steps this step depends on (for DAG execution).
+    /// When non-empty, the workflow engine uses topological ordering
+    /// instead of the default sequential/mode-based execution.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -454,6 +466,48 @@ impl WorkflowEngine {
             .collect()
     }
 
+    /// Build a `SubagentContext` from the current workflow state and format the
+    /// prompt with context preamble prepended (if applicable).
+    ///
+    /// Returns the (possibly enriched) prompt. Context is injected only when:
+    /// 1. The step's `inherit_context` is not explicitly `Some(false)`, AND
+    /// 2. The agent's `inherit_parent_context` manifest field is true.
+    fn build_context_prompt(
+        prompt: &str,
+        step: &WorkflowStep,
+        step_index: usize,
+        workflow_name: &str,
+        step_results: &[StepResult],
+        agent_inherit: bool,
+    ) -> String {
+        // Check whether context injection is enabled for this step
+        let inherit = step.inherit_context.unwrap_or(agent_inherit);
+        if !inherit {
+            return prompt.to_string();
+        }
+
+        let ctx = SubagentContext {
+            parent_agent_name: None,
+            parent_session_summary: None,
+            workflow_name: Some(workflow_name.to_string()),
+            step_index,
+            previous_outputs: step_results
+                .iter()
+                .map(|r| {
+                    (
+                        r.step_name.clone(),
+                        SubagentContext::truncate_output_preview(&r.output),
+                    )
+                })
+                .collect(),
+        };
+
+        match ctx.format_preamble() {
+            Some(preamble) => format!("{preamble}{prompt}"),
+            None => prompt.to_string(),
+        }
+    }
+
     /// Replace `{{var_name}}` references in a template with stored variable values.
     fn expand_variables(template: &str, input: &str, vars: &HashMap<String, String>) -> String {
         let mut result = template.replace("{{input}}", input);
@@ -542,19 +596,105 @@ impl WorkflowEngine {
         }
     }
 
+    /// Build a dependency graph from workflow steps.
+    ///
+    /// Returns a map from step index to the list of step indices it depends on.
+    fn build_dependency_graph(
+        steps: &[WorkflowStep],
+    ) -> Result<HashMap<usize, Vec<usize>>, String> {
+        // Check for duplicate step names
+        let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
+        for (i, s) in steps.iter().enumerate() {
+            if let Some(prev) = name_to_idx.insert(s.name.as_str(), i) {
+                return Err(format!(
+                    "Duplicate step name '{}' at positions {} and {}",
+                    s.name, prev, i
+                ));
+            }
+        }
+
+        let mut graph: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, step) in steps.iter().enumerate() {
+            let mut deps = Vec::new();
+            for dep_name in &step.depends_on {
+                let &dep_idx = name_to_idx.get(dep_name.as_str()).ok_or_else(|| {
+                    format!(
+                        "Step '{}' depends on '{}' which does not exist",
+                        step.name, dep_name
+                    )
+                })?;
+                deps.push(dep_idx);
+            }
+            graph.insert(i, deps);
+        }
+        Ok(graph)
+    }
+
+    /// Topological sort using Kahn's algorithm.
+    ///
+    /// Returns layers of step indices — steps within the same layer can run
+    /// in parallel, and layers must execute sequentially.
+    /// Returns `Err` if a cycle is detected.
+    fn topological_sort(steps: &[WorkflowStep]) -> Result<Vec<Vec<usize>>, String> {
+        let dep_graph = Self::build_dependency_graph(steps)?;
+        let n = steps.len();
+
+        // Build in-degree count and reverse adjacency (dependents)
+        let mut in_degree = vec![0usize; n];
+        let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&node, deps) in &dep_graph {
+            in_degree[node] = deps.len();
+            for &dep in deps {
+                dependents.entry(dep).or_default().push(node);
+            }
+        }
+
+        // Start with all nodes that have no dependencies
+        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut layers: Vec<Vec<usize>> = Vec::new();
+        let mut processed = 0;
+
+        while !queue.is_empty() {
+            // Current queue forms one parallel layer
+            let current_layer = std::mem::take(&mut queue);
+            for &node in &current_layer {
+                processed += 1;
+                if let Some(deps) = dependents.get(&node) {
+                    for &dependent in deps {
+                        in_degree[dependent] -= 1;
+                        if in_degree[dependent] == 0 {
+                            queue.push(dependent);
+                        }
+                    }
+                }
+            }
+            layers.push(current_layer);
+        }
+
+        if processed != n {
+            return Err("Cycle detected in workflow step dependencies".to_string());
+        }
+
+        Ok(layers)
+    }
+
     /// Execute a workflow run step-by-step.
     ///
     /// This method takes a closure that sends messages to agents,
     /// so the workflow engine remains decoupled from the kernel.
+    ///
+    /// The `agent_resolver` returns `(AgentId, agent_name, inherit_parent_context)`.
+    /// When `inherit_parent_context` is true and the step doesn't override it,
+    /// previous step outputs are prepended to the prompt as context.
     pub async fn execute_run<F, Fut>(
         &self,
         run_id: WorkflowRunId,
-        agent_resolver: impl Fn(&StepAgent) -> Option<(AgentId, String)>,
+        agent_resolver: impl Fn(&StepAgent) -> Option<(AgentId, String, bool)>,
         send_message: F,
     ) -> Result<String, String>
     where
-        F: Fn(AgentId, String) -> Fut,
-        Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
+        F: Fn(AgentId, String) -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send,
     {
         // Get the run and workflow
         let (workflow, input) = {
@@ -580,6 +720,14 @@ impl WorkflowEngine {
             "Starting workflow execution"
         );
 
+        // Check if any step has non-empty depends_on — if so, use DAG execution
+        let has_dag_deps = workflow.steps.iter().any(|s| !s.depends_on.is_empty());
+        if has_dag_deps {
+            return self
+                .execute_run_dag(run_id, &workflow, &input, &agent_resolver, &send_message)
+                .await;
+        }
+
         let mut current_input = input;
         let mut all_outputs: Vec<String> = Vec::new();
         let mut variables: HashMap<String, String> = HashMap::new();
@@ -596,11 +744,28 @@ impl WorkflowEngine {
 
             match &step.mode {
                 StepMode::Sequential => {
-                    let (agent_id, agent_name) = agent_resolver(&step.agent)
+                    let (agent_id, agent_name, agent_inherit) = agent_resolver(&step.agent)
                         .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
 
-                    let prompt =
+                    let raw_prompt =
                         Self::expand_variables(&step.prompt_template, &current_input, &variables);
+
+                    // Snapshot step results for context injection
+                    let prev_results: Vec<StepResult> = self
+                        .runs
+                        .read()
+                        .await
+                        .get(&run_id)
+                        .map(|r| r.step_results.clone())
+                        .unwrap_or_default();
+                    let prompt = Self::build_context_prompt(
+                        &raw_prompt,
+                        step,
+                        i,
+                        &workflow.name,
+                        &prev_results,
+                        agent_inherit,
+                    );
 
                     let start = std::time::Instant::now();
                     let result =
@@ -663,15 +828,32 @@ impl WorkflowEngine {
                     let mut futures = Vec::new();
                     let mut step_infos = Vec::new();
 
+                    // Snapshot step results once for all fan-out steps
+                    let prev_results: Vec<StepResult> = self
+                        .runs
+                        .read()
+                        .await
+                        .get(&run_id)
+                        .map(|r| r.step_results.clone())
+                        .unwrap_or_default();
+
                     for (idx, fan_step) in &fan_out_steps {
-                        let (agent_id, agent_name) =
-                            agent_resolver(&fan_step.agent).ok_or_else(|| {
+                        let (agent_id, agent_name, agent_inherit) = agent_resolver(&fan_step.agent)
+                            .ok_or_else(|| {
                                 format!("Agent not found for step '{}'", fan_step.name)
                             })?;
-                        let prompt = Self::expand_variables(
+                        let raw_prompt = Self::expand_variables(
                             &fan_step.prompt_template,
                             &current_input,
                             &variables,
+                        );
+                        let prompt = Self::build_context_prompt(
+                            &raw_prompt,
+                            fan_step,
+                            *idx,
+                            &workflow.name,
+                            &prev_results,
+                            agent_inherit,
                         );
                         let timeout_dur = std::time::Duration::from_secs(fan_step.timeout_secs);
 
@@ -772,11 +954,26 @@ impl WorkflowEngine {
                     }
 
                     // Condition met — execute like sequential
-                    let (agent_id, agent_name) = agent_resolver(&step.agent)
+                    let (agent_id, agent_name, agent_inherit) = agent_resolver(&step.agent)
                         .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
 
-                    let prompt =
+                    let raw_prompt =
                         Self::expand_variables(&step.prompt_template, &current_input, &variables);
+                    let prev_results: Vec<StepResult> = self
+                        .runs
+                        .read()
+                        .await
+                        .get(&run_id)
+                        .map(|r| r.step_results.clone())
+                        .unwrap_or_default();
+                    let prompt = Self::build_context_prompt(
+                        &raw_prompt,
+                        step,
+                        i,
+                        &workflow.name,
+                        &prev_results,
+                        agent_inherit,
+                    );
 
                     let start = std::time::Instant::now();
                     let result =
@@ -820,16 +1017,32 @@ impl WorkflowEngine {
                     max_iterations,
                     until,
                 } => {
-                    let (agent_id, agent_name) = agent_resolver(&step.agent)
+                    let (agent_id, agent_name, agent_inherit) = agent_resolver(&step.agent)
                         .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
 
                     let until_lower = until.to_lowercase();
 
                     for loop_iter in 0..*max_iterations {
-                        let prompt = Self::expand_variables(
+                        let raw_prompt = Self::expand_variables(
                             &step.prompt_template,
                             &current_input,
                             &variables,
+                        );
+                        // Re-snapshot step results each iteration (accumulates loop outputs)
+                        let prev_results: Vec<StepResult> = self
+                            .runs
+                            .read()
+                            .await
+                            .get(&run_id)
+                            .map(|r| r.step_results.clone())
+                            .unwrap_or_default();
+                        let prompt = Self::build_context_prompt(
+                            &raw_prompt,
+                            step,
+                            i,
+                            &workflow.name,
+                            &prev_results,
+                            agent_inherit,
                         );
 
                         let start = std::time::Instant::now();
@@ -909,6 +1122,279 @@ impl WorkflowEngine {
 
         info!(run_id = %run_id, "Workflow completed successfully");
         Ok(final_output)
+    }
+
+    /// DAG-based workflow execution.
+    ///
+    /// Steps are topologically sorted into layers based on `depends_on`.
+    /// Steps within the same layer run concurrently; layers execute
+    /// sequentially. Each step receives the workflow input plus any
+    /// variables produced by its dependencies via `output_var`.
+    async fn execute_run_dag<F, Fut>(
+        &self,
+        run_id: WorkflowRunId,
+        workflow: &Workflow,
+        input: &str,
+        agent_resolver: &impl Fn(&StepAgent) -> Option<(AgentId, String, bool)>,
+        send_message: &F,
+    ) -> Result<String, String>
+    where
+        F: Fn(AgentId, String) -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send,
+    {
+        let layers = Self::topological_sort(&workflow.steps)?;
+        let mut variables: HashMap<String, String> = HashMap::new();
+        // Track which step names have failed so we can skip dependents
+        let mut failed_steps: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last_output = input.to_string();
+
+        info!(
+            run_id = %run_id,
+            layers = layers.len(),
+            "Executing workflow in DAG mode"
+        );
+
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            debug!(
+                layer = layer_idx + 1,
+                steps = layer.len(),
+                "Executing DAG layer"
+            );
+
+            if layer.len() == 1 {
+                // Single step in layer — execute directly (no concurrency overhead)
+                let step_idx = layer[0];
+                let step = &workflow.steps[step_idx];
+
+                // Check if any dependency failed
+                let dep_failed = step.depends_on.iter().any(|dep| failed_steps.contains(dep));
+
+                if dep_failed {
+                    match step.error_mode {
+                        ErrorMode::Fail => {
+                            let error_msg =
+                                format!("Step '{}' skipped: dependency failed", step.name);
+                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                r.state = WorkflowRunState::Failed;
+                                r.error = Some(error_msg.clone());
+                                r.completed_at = Some(Utc::now());
+                            }
+                            return Err(error_msg);
+                        }
+                        _ => {
+                            warn!(
+                                step = %step.name,
+                                "Skipping step due to failed dependency"
+                            );
+                            failed_steps.insert(step.name.clone());
+                            continue;
+                        }
+                    }
+                }
+
+                let (agent_id, agent_name, _agent_inherit) = agent_resolver(&step.agent)
+                    .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+
+                let prompt = Self::expand_variables(&step.prompt_template, input, &variables);
+                let start = std::time::Instant::now();
+                let result =
+                    Self::execute_step_with_error_mode(step, agent_id, prompt, send_message).await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+
+                match result {
+                    Ok(Some((output, input_tokens, output_tokens))) => {
+                        let step_result = StepResult {
+                            step_name: step.name.clone(),
+                            agent_id: agent_id.to_string(),
+                            agent_name,
+                            output: output.clone(),
+                            input_tokens,
+                            output_tokens,
+                            duration_ms,
+                        };
+                        if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            r.step_results.push(step_result);
+                        }
+                        if let Some(ref var) = step.output_var {
+                            variables.insert(var.clone(), output.clone());
+                        }
+                        last_output = output;
+                        info!(
+                            step = %step.name,
+                            duration_ms,
+                            "DAG step completed"
+                        );
+                    }
+                    Ok(None) => {
+                        info!(step = %step.name, "DAG step skipped (error mode)");
+                        failed_steps.insert(step.name.clone());
+                    }
+                    Err(e) => {
+                        failed_steps.insert(step.name.clone());
+                        if matches!(step.error_mode, ErrorMode::Fail) {
+                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                r.state = WorkflowRunState::Failed;
+                                r.error = Some(e.clone());
+                                r.completed_at = Some(Utc::now());
+                            }
+                            return Err(e);
+                        }
+                        warn!(step = %step.name, error = %e, "DAG step failed (non-fatal)");
+                    }
+                }
+            } else {
+                // Multiple steps in layer — execute concurrently
+                let mut futures = Vec::new();
+                let mut step_metas: Vec<(usize, String, AgentId, String, bool)> = Vec::new();
+
+                for &step_idx in layer {
+                    let step = &workflow.steps[step_idx];
+
+                    let dep_failed = step.depends_on.iter().any(|dep| failed_steps.contains(dep));
+
+                    let (agent_id, agent_name, _agent_inherit) = agent_resolver(&step.agent)
+                        .ok_or_else(|| format!("Agent not found for step '{}'", step.name))?;
+
+                    step_metas.push((
+                        step_idx,
+                        step.name.clone(),
+                        agent_id,
+                        agent_name,
+                        dep_failed,
+                    ));
+
+                    // Each future returns (result, duration_ms) for per-step timing
+                    if dep_failed {
+                        let step_name = step.name.clone();
+                        let error_mode = step.error_mode.clone();
+                        futures.push(Box::pin(async move {
+                            let r = if matches!(error_mode, ErrorMode::Fail) {
+                                Err(format!("Step '{}' skipped: dependency failed", step_name))
+                            } else {
+                                Ok(None)
+                            };
+                            (r, 0u64)
+                        })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (
+                                                Result<Option<(String, u64, u64)>, String>,
+                                                u64,
+                                            ),
+                                        > + Send,
+                                >,
+                            >);
+                    } else {
+                        let prompt =
+                            Self::expand_variables(&step.prompt_template, input, &variables);
+                        let timeout_dur = std::time::Duration::from_secs(step.timeout_secs);
+                        let err_mode = step.error_mode.clone();
+                        let step_name = step.name.clone();
+
+                        futures.push(Box::pin(async move {
+                            let step_start = std::time::Instant::now();
+                            let result =
+                                tokio::time::timeout(timeout_dur, send_message(agent_id, prompt))
+                                    .await;
+                            let step_duration = step_start.elapsed().as_millis() as u64;
+                            let r = match result {
+                                Ok(Ok(output)) => Ok(Some(output)),
+                                Ok(Err(e)) => match err_mode {
+                                    ErrorMode::Fail => {
+                                        Err(format!("Step '{}' failed: {}", step_name, e))
+                                    }
+                                    _ => Ok(None),
+                                },
+                                Err(_) => match err_mode {
+                                    ErrorMode::Fail => {
+                                        Err(format!("Step '{}' timed out", step_name))
+                                    }
+                                    _ => Ok(None),
+                                },
+                            };
+                            (r, step_duration)
+                        })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (
+                                                Result<Option<(String, u64, u64)>, String>,
+                                                u64,
+                                            ),
+                                        > + Send,
+                                >,
+                            >);
+                    }
+                }
+
+                let layer_start = std::time::Instant::now();
+                let results = futures::future::join_all(futures).await;
+                let layer_duration_ms = layer_start.elapsed().as_millis() as u64;
+
+                for (k, (result, step_duration_ms)) in results.into_iter().enumerate() {
+                    let (step_idx, ref step_name, agent_id, ref agent_name, _dep_failed) =
+                        step_metas[k];
+                    let step = &workflow.steps[step_idx];
+
+                    match result {
+                        Ok(Some((output, input_tokens, output_tokens))) => {
+                            let step_result = StepResult {
+                                step_name: step_name.clone(),
+                                agent_id: agent_id.to_string(),
+                                agent_name: agent_name.clone(),
+                                output: output.clone(),
+                                input_tokens,
+                                output_tokens,
+                                duration_ms: step_duration_ms,
+                            };
+                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                r.step_results.push(step_result);
+                            }
+                            if let Some(ref var) = step.output_var {
+                                variables.insert(var.clone(), output.clone());
+                            }
+                            last_output = output;
+                            info!(
+                                step = %step_name,
+                                duration_ms = step_duration_ms,
+                                "DAG step completed"
+                            );
+                        }
+                        Ok(None) => {
+                            info!(step = %step_name, "DAG step skipped");
+                            failed_steps.insert(step_name.clone());
+                        }
+                        Err(e) => {
+                            failed_steps.insert(step_name.clone());
+                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                r.state = WorkflowRunState::Failed;
+                                r.error = Some(e.clone());
+                                r.completed_at = Some(Utc::now());
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+
+                info!(
+                    layer = layer_idx + 1,
+                    count = layer.len(),
+                    duration_ms = layer_duration_ms,
+                    "DAG layer completed"
+                );
+            }
+        }
+
+        // Mark workflow as completed
+        if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+            r.state = WorkflowRunState::Completed;
+            r.output = Some(last_output.clone());
+            r.completed_at = Some(Utc::now());
+        }
+
+        info!(run_id = %run_id, "Workflow DAG execution completed successfully");
+        Ok(last_output)
     }
 }
 
@@ -1034,6 +1520,15 @@ pub fn load_workflow_definitions(dir: &Path) -> Vec<Workflow> {
 
 use librefang_types::workflow_template::WorkflowTemplate;
 
+/// Convert a `serde_json::Value` to a plain string for template substitution.
+fn value_to_string(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 /// In-memory registry for storing and retrieving [`WorkflowTemplate`]s.
 ///
 /// Thread-safe: the registry is designed to be wrapped in an `Arc` and shared
@@ -1076,6 +1571,128 @@ impl WorkflowTemplateRegistry {
         let mut map = self.templates.write().await;
         map.remove(id)
     }
+
+    /// Load templates from a directory. Only reads top-level `*.toml` files.
+    ///
+    /// **Must not be called from async context** — uses blocking I/O.
+    pub fn load_templates_from_dir(&self, dir: &std::path::Path) -> usize {
+        use tracing::{info, warn};
+
+        if !dir.is_dir() {
+            return 0;
+        }
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Cannot read template directory {}: {e}", dir.display());
+                return 0;
+            }
+        };
+
+        let mut map = self.templates.blocking_write();
+        let mut count = 0;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            // Skip files > 1 MiB
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > 1_048_576 {
+                    warn!("Skipping oversized template file: {}", path.display());
+                    continue;
+                }
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Cannot read {}: {e}", path.display());
+                    continue;
+                }
+            };
+            match toml::from_str::<WorkflowTemplate>(&content) {
+                Ok(tpl) => {
+                    info!(id = %tpl.id, name = %tpl.name, "Loaded workflow template");
+                    map.insert(tpl.id.clone(), tpl);
+                    count += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to parse template {}: {e}", path.display());
+                }
+            }
+        }
+        count
+    }
+
+    /// Instantiate a concrete [`Workflow`] from a template by substituting
+    /// parameter values into step prompt templates.
+    ///
+    /// Returns an error if any required parameter is missing and has no default.
+    pub fn instantiate(
+        &self,
+        template: &WorkflowTemplate,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> Result<Workflow, String> {
+        // Build the resolved parameter map (apply defaults, validate required).
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        for p in &template.parameters {
+            if let Some(val) = params.get(&p.name) {
+                resolved.insert(p.name.clone(), value_to_string(val));
+            } else if let Some(ref default) = p.default {
+                resolved.insert(p.name.clone(), value_to_string(default));
+            } else if p.required {
+                return Err(format!("Missing required parameter: {}", p.name));
+            }
+        }
+
+        // Also include any extra params the caller provided that aren't declared
+        // (pass-through), so users can use ad-hoc placeholders.
+        for (k, v) in params {
+            resolved
+                .entry(k.clone())
+                .or_insert_with(|| value_to_string(v));
+        }
+
+        // Convert template steps → workflow steps.
+        let steps = template
+            .steps
+            .iter()
+            .map(|ts| {
+                let mut prompt = ts.prompt_template.clone();
+                for (k, v) in &resolved {
+                    prompt = prompt.replace(&format!("{{{{{}}}}}", k), v);
+                }
+                WorkflowStep {
+                    name: ts.name.clone(),
+                    agent: match &ts.agent {
+                        Some(a) => StepAgent::ByName { name: a.clone() },
+                        None => StepAgent::ByName {
+                            name: "default".into(),
+                        },
+                    },
+                    prompt_template: prompt,
+                    mode: StepMode::Sequential,
+                    timeout_secs: 120,
+                    error_mode: ErrorMode::Fail,
+                    // Use step name as output_var so subsequent steps can reference via {{step_name}}
+                    output_var: Some(ts.name.clone()),
+                    inherit_context: None,
+                    depends_on: vec![],
+                }
+            })
+            .collect();
+
+        Ok(Workflow {
+            id: WorkflowId::new(),
+            name: template.name.clone(),
+            description: template.description.clone(),
+            steps,
+            created_at: Utc::now(),
+            layout: None,
+        })
+    }
 }
 
 impl Default for WorkflowTemplateRegistry {
@@ -1104,6 +1721,8 @@ mod tests {
                     timeout_secs: 30,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "summarize".to_string(),
@@ -1115,6 +1734,8 @@ mod tests {
                     timeout_secs: 30,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
             ],
             created_at: Utc::now(),
@@ -1122,9 +1743,14 @@ mod tests {
         }
     }
 
-    fn mock_resolver(agent: &StepAgent) -> Option<(AgentId, String)> {
+    fn mock_resolver(agent: &StepAgent) -> Option<(AgentId, String, bool)> {
         let _ = agent;
-        Some((AgentId::new(), "mock-agent".to_string()))
+        Some((AgentId::new(), "mock-agent".to_string(), true))
+    }
+
+    fn mock_resolver_no_inherit(agent: &StepAgent) -> Option<(AgentId, String, bool)> {
+        let _ = agent;
+        Some((AgentId::new(), "mock-agent".to_string(), false))
     }
 
     #[tokio::test]
@@ -1217,6 +1843,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "only-if-error".to_string(),
@@ -1230,6 +1858,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
             ],
             created_at: Utc::now(),
@@ -1270,6 +1900,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "only-if-error".to_string(),
@@ -1283,6 +1915,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
             ],
             created_at: Utc::now(),
@@ -1324,6 +1958,8 @@ mod tests {
                 timeout_secs: 10,
                 error_mode: ErrorMode::Fail,
                 output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
             }],
             created_at: Utc::now(),
             layout: None,
@@ -1371,6 +2007,8 @@ mod tests {
                 timeout_secs: 10,
                 error_mode: ErrorMode::Fail,
                 output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
             }],
             created_at: Utc::now(),
             layout: None,
@@ -1407,6 +2045,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Skip,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "succeeds".to_string(),
@@ -1418,6 +2058,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
             ],
             created_at: Utc::now(),
@@ -1466,6 +2108,8 @@ mod tests {
                 timeout_secs: 10,
                 error_mode: ErrorMode::Retry { max_retries: 2 },
                 output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
             }],
             created_at: Utc::now(),
             layout: None,
@@ -1511,6 +2155,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: Some("first_result".to_string()),
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "transform".to_string(),
@@ -1522,6 +2168,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: Some("second_result".to_string()),
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "combine".to_string(),
@@ -1534,6 +2182,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
             ],
             created_at: Utc::now(),
@@ -1582,6 +2232,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "task-b".to_string(),
@@ -1593,6 +2245,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
                 WorkflowStep {
                     name: "collect".to_string(),
@@ -1604,6 +2258,8 @@ mod tests {
                     timeout_secs: 10,
                     error_mode: ErrorMode::Fail,
                     output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
                 },
             ],
             created_at: Utc::now(),
@@ -1933,5 +2589,522 @@ id = "{id}"
 
         assert!(reg.get("r1").await.is_none());
         assert!(reg.remove("r1").await.is_none());
+    }
+
+    // ---- Subagent context inheritance tests ----
+
+    #[tokio::test]
+    async fn test_context_injected_in_second_step() {
+        let engine = WorkflowEngine::new();
+        let wf = test_workflow();
+        let wf_id = engine.register(wf).await;
+        let run_id = engine
+            .create_run(wf_id, "raw data".to_string())
+            .await
+            .unwrap();
+
+        let received_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rp = received_prompts.clone();
+        let sender = move |_id: AgentId, msg: String| {
+            let rp = rp.clone();
+            async move {
+                rp.lock().unwrap().push(msg.clone());
+                Ok(("Output for step".to_string(), 10u64, 5u64))
+            }
+        };
+
+        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        assert!(result.is_ok());
+
+        let prompts = received_prompts.lock().unwrap();
+        // First step: no previous outputs, so no context preamble
+        assert!(!prompts[0].contains("[Parent workflow context]"));
+        // Second step: should contain context from first step
+        assert!(prompts[1].contains("[Parent workflow context]"));
+        assert!(prompts[1].contains("Previous steps completed:"));
+        assert!(prompts[1].contains("analyze:"));
+    }
+
+    #[tokio::test]
+    async fn test_context_disabled_via_agent_manifest() {
+        let engine = WorkflowEngine::new();
+        let wf = test_workflow();
+        let wf_id = engine.register(wf).await;
+        let run_id = engine
+            .create_run(wf_id, "raw data".to_string())
+            .await
+            .unwrap();
+
+        let received_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rp = received_prompts.clone();
+        let sender = move |_id: AgentId, msg: String| {
+            let rp = rp.clone();
+            async move {
+                rp.lock().unwrap().push(msg.clone());
+                Ok(("Output".to_string(), 10u64, 5u64))
+            }
+        };
+
+        // Use resolver that returns inherit_parent_context=false
+        let result = engine
+            .execute_run(run_id, mock_resolver_no_inherit, sender)
+            .await;
+        assert!(result.is_ok());
+
+        let prompts = received_prompts.lock().unwrap();
+        // Neither step should have context injected
+        assert!(!prompts[0].contains("[Parent workflow context]"));
+        assert!(!prompts[1].contains("[Parent workflow context]"));
+    }
+
+    #[tokio::test]
+    async fn test_context_disabled_via_step_override() {
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "override-test".to_string(),
+            description: "".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "first".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "{{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "second".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "Do: {{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: Some(false),
+                    depends_on: vec![],
+                },
+            ],
+            created_at: Utc::now(),
+            layout: None,
+        };
+        let wf_id = engine.register(wf).await;
+        let run_id = engine
+            .create_run(wf_id, "test input".to_string())
+            .await
+            .unwrap();
+
+        let received_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rp = received_prompts.clone();
+        let sender = move |_id: AgentId, msg: String| {
+            let rp = rp.clone();
+            async move {
+                rp.lock().unwrap().push(msg.clone());
+                Ok(("Output".to_string(), 10u64, 5u64))
+            }
+        };
+
+        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        assert!(result.is_ok());
+
+        let prompts = received_prompts.lock().unwrap();
+        // First step: no previous outputs, so no context preamble
+        assert!(!prompts[0].contains("[Parent workflow context]"));
+        // Second step: inherit_context=Some(false) overrides agent setting,
+        // so no context should be injected
+        assert!(!prompts[1].contains("[Parent workflow context]"));
+    }
+
+    // ---- DAG execution tests ----
+
+    #[test]
+    fn test_dag_topological_sort_simple() {
+        // Linear chain: A -> B -> C
+        let steps = vec![
+            WorkflowStep {
+                name: "A".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+            },
+            WorkflowStep {
+                name: "B".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec!["A".to_string()],
+            },
+            WorkflowStep {
+                name: "C".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec!["B".to_string()],
+            },
+        ];
+
+        let layers = WorkflowEngine::topological_sort(&steps).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![0]); // A
+        assert_eq!(layers[1], vec![1]); // B
+        assert_eq!(layers[2], vec![2]); // C
+    }
+
+    #[tokio::test]
+    async fn test_dag_parallel_execution() {
+        // A and B are independent, C depends on both
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "dag-parallel".to_string(),
+            description: "".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "A".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "Task A: {{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("a_result".to_string()),
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "B".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "Task B: {{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: Some("b_result".to_string()),
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "C".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "Combine: {{a_result}} + {{b_result}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    // Explicitly disable context for this step
+                    inherit_context: Some(false),
+                    depends_on: vec!["A".to_string(), "B".to_string()],
+                },
+            ],
+            created_at: Utc::now(),
+            layout: None,
+        };
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        let received_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rp = received_prompts.clone();
+        let sender = move |_id: AgentId, msg: String| {
+            let rp = rp.clone();
+            async move {
+                rp.lock().unwrap().push(msg.clone());
+                Ok(("done".to_string(), 10u64, 5u64))
+            }
+        };
+
+        // Agent says inherit=true, but step overrides to false
+        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        assert!(result.is_ok());
+
+        let prompts = received_prompts.lock().unwrap();
+        // Second step should NOT have context despite agent allowing it
+        assert!(!prompts[1].contains("[Parent workflow context]"));
+    }
+
+    #[test]
+    fn test_build_context_prompt_no_results() {
+        let step = WorkflowStep {
+            name: "s".to_string(),
+            agent: StepAgent::ByName {
+                name: "a".to_string(),
+            },
+            prompt_template: "do it".to_string(),
+            mode: StepMode::Sequential,
+            timeout_secs: 10,
+            error_mode: ErrorMode::Fail,
+            output_var: None,
+            inherit_context: None,
+            depends_on: vec![],
+        };
+        let result = WorkflowEngine::build_context_prompt("hello", &step, 0, "wf", &[], true);
+        // No previous results => no preamble
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_build_context_prompt_with_results() {
+        let step = WorkflowStep {
+            name: "s2".to_string(),
+            agent: StepAgent::ByName {
+                name: "a".to_string(),
+            },
+            prompt_template: "do it".to_string(),
+            mode: StepMode::Sequential,
+            timeout_secs: 10,
+            error_mode: ErrorMode::Fail,
+            output_var: None,
+            inherit_context: None,
+            depends_on: vec![],
+        };
+        let results = vec![StepResult {
+            step_name: "s1".to_string(),
+            agent_id: "id-1".to_string(),
+            agent_name: "agent-1".to_string(),
+            output: "analysis complete".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            duration_ms: 100,
+        }];
+        let prompt = WorkflowEngine::build_context_prompt(
+            "summarize",
+            &step,
+            1,
+            "my-pipeline",
+            &results,
+            true,
+        );
+        assert!(prompt.contains("[Parent workflow context]"));
+        assert!(prompt.contains("Workflow: my-pipeline"));
+        assert!(prompt.contains("- s1: analysis complete"));
+        assert!(prompt.ends_with("summarize"));
+    }
+
+    #[test]
+    fn test_build_context_prompt_truncates_long_output() {
+        let step = WorkflowStep {
+            name: "s2".to_string(),
+            agent: StepAgent::ByName {
+                name: "a".to_string(),
+            },
+            prompt_template: "do it".to_string(),
+            mode: StepMode::Sequential,
+            timeout_secs: 10,
+            error_mode: ErrorMode::Fail,
+            output_var: None,
+            inherit_context: None,
+            depends_on: vec![],
+        };
+        let results = vec![StepResult {
+            step_name: "s1".to_string(),
+            agent_id: "id-1".to_string(),
+            agent_name: "agent-1".to_string(),
+            output: "x".repeat(2000),
+            input_tokens: 10,
+            output_tokens: 5,
+            duration_ms: 100,
+        }];
+        let prompt = WorkflowEngine::build_context_prompt("next", &step, 1, "wf", &results, true);
+        assert!(prompt.contains("..."));
+        // The full 2000-char output should NOT appear
+        assert!(!prompt.contains(&"x".repeat(2000)));
+    }
+
+    #[test]
+    fn test_inherit_context_step_field_serde_default() {
+        // When inherit_context is omitted from JSON, it should default to None
+        let json = r#"{
+            "name": "s1",
+            "agent": { "name": "a" },
+            "prompt_template": "{{input}}"
+        }"#;
+        let step: WorkflowStep = serde_json::from_str(json).unwrap();
+        assert!(step.inherit_context.is_none());
+    }
+
+    #[test]
+    fn test_inherit_context_step_field_explicit_false() {
+        let json = r#"{
+            "name": "s1",
+            "agent": { "name": "a" },
+            "prompt_template": "{{input}}",
+            "inherit_context": false
+        }"#;
+        let step: WorkflowStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.inherit_context, Some(false));
+    }
+
+    #[test]
+    fn test_dag_topological_sort_layers() {
+        // Verify topological order: A and B in first layer, C in second
+        let layers = WorkflowEngine::topological_sort(&[
+            WorkflowStep {
+                name: "A".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+            },
+            WorkflowStep {
+                name: "B".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+            },
+            WorkflowStep {
+                name: "C".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec!["A".to_string(), "B".to_string()],
+            },
+        ])
+        .unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].len(), 2); // A and B in parallel
+        assert_eq!(layers[1], vec![2]); // C
+    }
+
+    #[test]
+    fn test_dag_cycle_detection() {
+        // A -> B -> A (cycle)
+        let steps = vec![
+            WorkflowStep {
+                name: "A".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec!["B".to_string()],
+            },
+            WorkflowStep {
+                name: "B".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec!["A".to_string()],
+            },
+        ];
+
+        let result = WorkflowEngine::topological_sort(&steps);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Cycle detected"));
+    }
+
+    #[tokio::test]
+    async fn test_dag_dependency_failure_propagation() {
+        // A fails, B depends on A -> B should be skipped and workflow fails
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "dag-fail-prop".to_string(),
+            description: "".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "A".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "{{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "B".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "{{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec!["A".to_string()],
+                },
+            ],
+            created_at: Utc::now(),
+            layout: None,
+        };
+
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        // Sender always fails
+        let sender = |_id: AgentId, _msg: String| async move {
+            Err::<(String, u64, u64), String>("simulated failure".to_string())
+        };
+
+        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed"));
+
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(matches!(run.state, WorkflowRunState::Failed));
+        // A failed, B was never attempted
+        assert_eq!(run.step_results.len(), 0);
     }
 }

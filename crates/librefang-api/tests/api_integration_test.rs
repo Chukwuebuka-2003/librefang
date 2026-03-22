@@ -99,10 +99,13 @@ async fn start_test_server_with_provider(
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        skillhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: librefang_runtime::provider_health::ProbeCache::new(),
         webhook_store: librefang_api::webhook_store::WebhookStore::load(std::env::temp_dir().join(
             format!("librefang-test-webhooks-{}.json", uuid::Uuid::new_v4()),
         )),
+        #[cfg(feature = "telemetry")]
+        prometheus_handle: None,
     });
 
     let app = Router::new()
@@ -469,7 +472,12 @@ async fn test_build_router_unauthorized_responses_include_api_version_header() {
 async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     let harness = start_full_router("").await;
 
-    let source_dir = harness.state.kernel.config.home_dir.join("openclaw-source");
+    let source_dir = harness
+        .state
+        .kernel
+        .config_ref()
+        .home_dir
+        .join("openclaw-source");
     std::fs::create_dir_all(&source_dir).unwrap();
     std::fs::write(
         source_dir.join("openclaw.json"),
@@ -512,11 +520,16 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     assert_eq!(json["status"], "completed");
     assert_eq!(json["dry_run"], false);
 
-    let config_path = harness.state.kernel.config.home_dir.join("config.toml");
+    let config_path = harness
+        .state
+        .kernel
+        .config_ref()
+        .home_dir
+        .join("config.toml");
     let agent_path = harness
         .state
         .kernel
-        .config
+        .config_ref()
         .home_dir
         .join("agents")
         .join("main")
@@ -524,7 +537,7 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     let report_path = harness
         .state
         .kernel
-        .config
+        .config_ref()
         .home_dir
         .join("migration_report.md");
 
@@ -552,11 +565,27 @@ async fn test_config_reload_reports_proxy_changes_require_restart() {
     let table = config.as_table_mut().unwrap();
     table.insert(
         "home_dir".to_string(),
-        toml::Value::String(server.state.kernel.config.home_dir.display().to_string()),
+        toml::Value::String(
+            server
+                .state
+                .kernel
+                .config_ref()
+                .home_dir
+                .display()
+                .to_string(),
+        ),
     );
     table.insert(
         "data_dir".to_string(),
-        toml::Value::String(server.state.kernel.config.data_dir.display().to_string()),
+        toml::Value::String(
+            server
+                .state
+                .kernel
+                .config_ref()
+                .data_dir
+                .display()
+                .to_string(),
+        ),
     );
     table.insert(
         "proxy".to_string(),
@@ -694,13 +723,13 @@ async fn test_agent_monitoring_endpoints() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let agent_id = body["agent_id"].as_str().unwrap().to_string();
 
-    server.state.kernel.audit_log.record(
+    server.state.kernel.audit().record(
         agent_id.clone(),
         AuditAction::AgentMessage,
         "exact match target",
         "custom_error",
     );
-    server.state.kernel.audit_log.record(
+    server.state.kernel.audit().record(
         agent_id.clone(),
         AuditAction::AgentMessage,
         "should not match substring filter",
@@ -1333,13 +1362,18 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         channels_config: tokio::sync::RwLock::new(Default::default()),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        skillhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: librefang_runtime::provider_health::ProbeCache::new(),
         webhook_store: librefang_api::webhook_store::WebhookStore::load(std::env::temp_dir().join(
             format!("librefang-test-webhooks-{}.json", uuid::Uuid::new_v4()),
         )),
+        #[cfg(feature = "telemetry")]
+        prometheus_handle: None,
     });
 
-    let api_key_state = state.kernel.config.api_key.clone();
+    let api_key_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+        state.kernel.config_ref().api_key.clone(),
+    ));
 
     let app = Router::new()
         .route("/api/health", axum::routing::get(routes::health))

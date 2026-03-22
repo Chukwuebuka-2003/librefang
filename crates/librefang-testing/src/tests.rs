@@ -1,0 +1,338 @@
+//! Example tests — demonstrates how to use the test infrastructure.
+
+use crate::{assert_json_error, assert_json_ok, test_request, MockKernelBuilder, TestAppState};
+use axum::http::{Method, StatusCode};
+use tower::ServiceExt;
+
+/// Tests that GET /api/health returns 200 and contains a status field.
+#[tokio::test]
+async fn test_health_endpoint() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let req = test_request(Method::GET, "/api/health", None);
+    let resp = router.oneshot(req).await.expect("request failed");
+    let json = assert_json_ok(resp).await;
+
+    // Health endpoint should return a status field
+    assert!(
+        json.get("status").is_some(),
+        "health check should contain a status field, got: {json}"
+    );
+    let status = json["status"].as_str().unwrap();
+    assert!(
+        status == "ok" || status == "degraded",
+        "status should be ok or degraded, got: {status}"
+    );
+}
+
+/// Tests that GET /api/agents returns an items array and a total field.
+#[tokio::test]
+async fn test_list_agents() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let req = test_request(Method::GET, "/api/agents", None);
+    let resp = router.oneshot(req).await.expect("request failed");
+    let json = assert_json_ok(resp).await;
+
+    // list_agents returns {"items": [...], "total": N, "offset": 0}
+    assert!(
+        json.get("items").is_some(),
+        "list_agents should return an items field, got: {json}"
+    );
+    assert!(
+        json["items"].is_array(),
+        "items should be an array, got: {}",
+        json["items"]
+    );
+    assert!(
+        json.get("total").is_some(),
+        "list_agents should return a total field, got: {json}"
+    );
+    // Verify total is a valid unsigned integer
+    assert!(
+        json["total"].is_u64(),
+        "total should be an unsigned integer, got: {}",
+        json["total"]
+    );
+}
+
+/// Tests that GET /api/agents/{id} with an invalid ID returns 400.
+#[tokio::test]
+async fn test_get_agent_invalid_id() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let req = test_request(Method::GET, "/api/agents/not-a-valid-uuid", None);
+    let resp = router.oneshot(req).await.expect("request failed");
+    let json = assert_json_error(resp, StatusCode::BAD_REQUEST).await;
+
+    assert!(
+        json.get("error").is_some(),
+        "error response should contain an error field, got: {json}"
+    );
+}
+
+/// Tests that GET /api/agents/{id} with a valid but nonexistent UUID returns 404.
+#[tokio::test]
+async fn test_get_agent_not_found() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    // Use a valid UUID that does not exist in the registry
+    let fake_id = uuid::Uuid::new_v4();
+    let path = format!("/api/agents/{fake_id}");
+    let req = test_request(Method::GET, &path, None);
+    let resp = router.oneshot(req).await.expect("request failed");
+    let json = assert_json_error(resp, StatusCode::NOT_FOUND).await;
+
+    assert!(
+        json.get("error").is_some(),
+        "404 response should contain an error field, got: {json}"
+    );
+}
+
+/// Tests MockLlmDriver call recording functionality.
+#[tokio::test]
+async fn test_mock_llm_driver_recording() {
+    use crate::MockLlmDriver;
+    use librefang_runtime::llm_driver::{CompletionRequest, LlmDriver};
+
+    let driver = MockLlmDriver::new(vec!["回复1".into(), "回复2".into()]);
+
+    let request = CompletionRequest {
+        model: "test-model".into(),
+        messages: vec![],
+        tools: vec![],
+        max_tokens: 100,
+        temperature: 0.0,
+        system: Some("test system prompt".into()),
+        thinking: None,
+        prompt_caching: false,
+    };
+
+    // First call
+    let resp1 = driver.complete(request.clone()).await.unwrap();
+    assert_eq!(resp1.text(), "回复1");
+
+    // Second call
+    let resp2 = driver.complete(request).await.unwrap();
+    assert_eq!(resp2.text(), "回复2");
+
+    // Verify call recording
+    assert_eq!(driver.call_count(), 2);
+    let calls = driver.recorded_calls();
+    assert_eq!(calls[0].model, "test-model");
+    assert_eq!(calls[0].system, Some("test system prompt".into()));
+}
+
+/// Tests building a kernel with custom config.
+#[tokio::test]
+async fn test_custom_config_kernel() {
+    let app = TestAppState::with_builder(MockKernelBuilder::new().with_config(|cfg| {
+        cfg.language = "zh".into();
+    }));
+
+    // Verify that the custom configuration took effect
+    assert_eq!(app.state.kernel.config_ref().language, "zh");
+}
+
+/// Tests the GET /api/version endpoint.
+#[tokio::test]
+async fn test_version_endpoint() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let req = test_request(Method::GET, "/api/version", None);
+    let resp = router.oneshot(req).await.expect("request failed");
+    let json = assert_json_ok(resp).await;
+
+    assert!(
+        json.get("version").is_some(),
+        "version endpoint should contain a version field, got: {json}"
+    );
+}
+
+// -- POST / PUT / DELETE tests ------------------------------------------------
+
+/// Tests POST /api/agents — creates an agent using manifest_toml.
+#[tokio::test]
+async fn test_spawn_agent_post() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let manifest = r#"
+[agent]
+name = "test-bot"
+system_prompt = "You are a test bot."
+"#;
+    let body = serde_json::json!({ "manifest_toml": manifest }).to_string();
+    let req = test_request(Method::POST, "/api/agents", Some(&body));
+    let resp = router.oneshot(req).await.expect("request failed");
+    let status = resp.status();
+
+    // spawn should return 200 or 201 (with agent id)
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED,
+        "spawn_agent should return 200/201, got: {status}"
+    );
+}
+
+/// Tests DELETE /api/agents/{id} — deleting a nonexistent agent should return an error.
+#[tokio::test]
+async fn test_delete_agent_not_found() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let fake_id = uuid::Uuid::new_v4();
+    let path = format!("/api/agents/{fake_id}");
+    let req = test_request(Method::DELETE, &path, None);
+    let resp = router.oneshot(req).await.expect("request failed");
+
+    // Deleting a nonexistent agent should return 404
+    let json = assert_json_error(resp, StatusCode::NOT_FOUND).await;
+    assert!(
+        json.get("error").is_some(),
+        "DELETE 404 response should contain an error field, got: {json}"
+    );
+}
+
+/// Tests PUT /api/agents/{id}/model — setting model for a nonexistent agent should return an error.
+#[tokio::test]
+async fn test_set_model_not_found() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let fake_id = uuid::Uuid::new_v4();
+    let path = format!("/api/agents/{fake_id}/model");
+    let body = serde_json::json!({ "model": "gpt-4" }).to_string();
+    let req = test_request(Method::PUT, &path, Some(&body));
+    let resp = router.oneshot(req).await.expect("request failed");
+
+    // Nonexistent agent should return a non-200 error status code
+    let status = resp.status();
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "set_model for a nonexistent agent should return an error status code, got: {status}"
+    );
+}
+
+/// Tests POST /api/agents/{id}/message — sending a message to a nonexistent agent should return an error.
+#[tokio::test]
+async fn test_send_message_agent_not_found() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let fake_id = uuid::Uuid::new_v4();
+    let path = format!("/api/agents/{fake_id}/message");
+    let body = serde_json::json!({ "message": "hello" }).to_string();
+    let req = test_request(Method::POST, &path, Some(&body));
+    let resp = router.oneshot(req).await.expect("request failed");
+
+    let status = resp.status();
+    assert!(
+        status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+        "send_message for a nonexistent agent should return 404/400, got: {status}"
+    );
+}
+
+/// Tests PATCH /api/agents/{id} — updating a nonexistent agent should return an error.
+#[tokio::test]
+async fn test_patch_agent_not_found() {
+    let app = TestAppState::new();
+    let router = app.router();
+
+    let fake_id = uuid::Uuid::new_v4();
+    let path = format!("/api/agents/{fake_id}");
+    let body = serde_json::json!({ "name": "new-name" }).to_string();
+    let req = test_request(Method::PATCH, &path, Some(&body));
+    let resp = router.oneshot(req).await.expect("request failed");
+
+    let status = resp.status();
+    assert!(
+        status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+        "patch_agent for a nonexistent agent should return 404/400, got: {status}"
+    );
+}
+
+// -- MockLlmDriver builder method tests ---------------------------------------
+
+/// Tests MockLlmDriver's with_tokens and with_stop_reason custom settings.
+#[tokio::test]
+async fn test_mock_llm_driver_custom_tokens_and_stop_reason() {
+    use crate::MockLlmDriver;
+    use librefang_runtime::llm_driver::{CompletionRequest, LlmDriver};
+    use librefang_types::message::StopReason;
+
+    let driver = MockLlmDriver::with_response("test")
+        .with_tokens(200, 100)
+        .with_stop_reason(StopReason::MaxTokens);
+
+    let request = CompletionRequest {
+        model: "test-model".into(),
+        messages: vec![],
+        tools: vec![],
+        max_tokens: 100,
+        temperature: 0.0,
+        system: None,
+        thinking: None,
+        prompt_caching: false,
+    };
+
+    let resp = driver.complete(request).await.unwrap();
+    assert_eq!(
+        resp.usage.input_tokens, 200,
+        "input_tokens should be the custom value 200"
+    );
+    assert_eq!(
+        resp.usage.output_tokens, 100,
+        "output_tokens should be the custom value 100"
+    );
+    assert_eq!(
+        resp.stop_reason,
+        StopReason::MaxTokens,
+        "stop_reason should be MaxTokens"
+    );
+}
+
+// -- FailingLlmDriver tests ---------------------------------------------------
+
+/// Tests that FailingLlmDriver always returns errors (for error handling scenarios).
+#[tokio::test]
+async fn test_failing_llm_driver() {
+    use crate::FailingLlmDriver;
+    use librefang_runtime::llm_driver::{CompletionRequest, LlmDriver};
+
+    let driver = FailingLlmDriver::new("模拟的 API 错误");
+
+    let request = CompletionRequest {
+        model: "test-model".into(),
+        messages: vec![],
+        tools: vec![],
+        max_tokens: 100,
+        temperature: 0.0,
+        system: None,
+        thinking: None,
+        prompt_caching: false,
+    };
+
+    let result = driver.complete(request).await;
+    assert!(
+        result.is_err(),
+        "FailingLlmDriver should always return an error"
+    );
+
+    let err = result.unwrap_err();
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("模拟的 API 错误"),
+        "error message should contain the custom content, got: {err_msg}"
+    );
+
+    // FailingLlmDriver's is_configured should return false
+    assert!(
+        !driver.is_configured(),
+        "FailingLlmDriver.is_configured() should return false"
+    );
+}

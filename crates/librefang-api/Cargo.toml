@@ -43,12 +43,31 @@ dirs = { workspace = true }
 jsonwebtoken = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+tracing-subscriber = { workspace = true }
 utoipa = { version = "5", features = ["axum_extras"] }
 include_dir = "0.7"
+
+# Optional telemetry deps (gated behind `telemetry` feature)
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
 default = ["all-channels", "telemetry"]
 telemetry = []
+
+# OpenTelemetry tracing export + Prometheus metrics
+telemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+]
 
 # Individual channel features — forwarded to librefang-channels
 channel-telegram = ["librefang-channels/channel-telegram"]
@@ -92,6 +111,7 @@ channel-linkedin = ["librefang-channels/channel-linkedin"]
 channel-mumble = ["librefang-channels/channel-mumble"]
 channel-ntfy = ["librefang-channels/channel-ntfy"]
 channel-qq = ["librefang-channels/channel-qq"]
+channel-wechat = ["librefang-channels/channel-wechat"]
 channel-wecom = ["librefang-channels/channel-wecom"]
 
 all-channels = [
@@ -105,7 +125,7 @@ all-channels = [
     "channel-nostr", "channel-pumble", "channel-threema", "channel-twist",
     "channel-webex", "channel-dingtalk", "channel-discourse", "channel-gitter",
     "channel-gotify", "channel-linkedin", "channel-mumble", "channel-ntfy",
-    "channel-qq", "channel-wecom",
+    "channel-qq", "channel-wechat", "channel-wecom",
 ]
 
 # Mini: 12 core channels

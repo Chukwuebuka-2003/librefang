@@ -69,6 +69,17 @@ body {
   @apply text-slate-900 dark:text-slate-100 transition-colors duration-300;
 }
 
+.katex-display {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 0.25rem;
+}
+
+.katex {
+  font-size: 1em;
+}
+
 .dark body {
   background:
     radial-gradient(circle at top, rgba(30, 64, 175, 0.15) 0%, rgba(2, 6, 23, 1) 80%),
@@ -148,15 +159,23 @@ body {
   will-change: transform, opacity, filter;
 }
 .stagger-children > *:nth-child(1) { animation-delay: 0ms; }
-.stagger-children > *:nth-child(2) { animation-delay: 60ms; }
-.stagger-children > *:nth-child(3) { animation-delay: 120ms; }
-.stagger-children > *:nth-child(4) { animation-delay: 180ms; }
-.stagger-children > *:nth-child(5) { animation-delay: 240ms; }
-.stagger-children > *:nth-child(6) { animation-delay: 300ms; }
-.stagger-children > *:nth-child(7) { animation-delay: 360ms; }
-.stagger-children > *:nth-child(8) { animation-delay: 420ms; }
-.stagger-children > *:nth-child(9) { animation-delay: 480ms; }
-.stagger-children > *:nth-child(10) { animation-delay: 540ms; }
+.stagger-children > *:nth-child(2) { animation-delay: 40ms; }
+.stagger-children > *:nth-child(3) { animation-delay: 80ms; }
+.stagger-children > *:nth-child(4) { animation-delay: 120ms; }
+.stagger-children > *:nth-child(5) { animation-delay: 160ms; }
+.stagger-children > *:nth-child(6) { animation-delay: 200ms; }
+.stagger-children > *:nth-child(7) { animation-delay: 240ms; }
+.stagger-children > *:nth-child(8) { animation-delay: 280ms; }
+.stagger-children > *:nth-child(9) { animation-delay: 320ms; }
+.stagger-children > *:nth-child(10) { animation-delay: 360ms; }
+
+/* ── Mobile: skip stagger delay ────────────────── */
+@media (max-width: 639px) {
+  .stagger-children > * {
+    animation-delay: 0ms !important;
+    animation-duration: 0.3s;
+  }
+}
 
 /* ── Card hover — Apple-style depth + glow ──────── */
 .card-glow {

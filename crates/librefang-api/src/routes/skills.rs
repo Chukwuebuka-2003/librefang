@@ -1,5 +1,138 @@
 //! Skills, marketplace, ClawHub, hands, and extension handlers.
 
+/// Build routes for the skills/marketplace/hands/MCP/integrations/extensions domain.
+pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
+    axum::Router::new()
+        // Skills
+        .route("/skills", axum::routing::get(list_skills))
+        .route("/skills/install", axum::routing::post(install_skill))
+        .route("/skills/uninstall", axum::routing::post(uninstall_skill))
+        .route("/skills/create", axum::routing::post(create_skill))
+        // Marketplace / ClawHub
+        .route(
+            "/marketplace/search",
+            axum::routing::get(marketplace_search),
+        )
+        .route("/clawhub/search", axum::routing::get(clawhub_search))
+        .route("/clawhub/browse", axum::routing::get(clawhub_browse))
+        .route(
+            "/clawhub/skill/{slug}",
+            axum::routing::get(clawhub_skill_detail),
+        )
+        .route(
+            "/clawhub/skill/{slug}/code",
+            axum::routing::get(clawhub_skill_code),
+        )
+        .route("/clawhub/install", axum::routing::post(clawhub_install))
+        // Skillhub marketplace
+        .route(
+            "/skillhub/search",
+            axum::routing::get(skillhub_search),
+        )
+        .route(
+            "/skillhub/browse",
+            axum::routing::get(skillhub_browse),
+        )
+        .route(
+            "/skillhub/skill/{slug}",
+            axum::routing::get(skillhub_skill_detail),
+        )
+        .route(
+            "/skillhub/skill/{slug}/code",
+            axum::routing::get(skillhub_skill_code),
+        )
+        .route(
+            "/skillhub/install",
+            axum::routing::post(skillhub_install),
+        )
+        // Hands (browser automation engine)
+        .route("/hands", axum::routing::get(list_hands))
+        .route("/hands/install", axum::routing::post(install_hand))
+        .route("/hands/active", axum::routing::get(list_active_hands))
+        .route("/hands/{hand_id}", axum::routing::get(get_hand))
+        .route(
+            "/hands/{hand_id}/activate",
+            axum::routing::post(activate_hand),
+        )
+        .route(
+            "/hands/{hand_id}/check-deps",
+            axum::routing::post(check_hand_deps),
+        )
+        .route(
+            "/hands/{hand_id}/install-deps",
+            axum::routing::post(install_hand_deps),
+        )
+        .route(
+            "/hands/{hand_id}/settings",
+            axum::routing::get(get_hand_settings).put(update_hand_settings),
+        )
+        .route(
+            "/hands/instances/{id}/pause",
+            axum::routing::post(pause_hand),
+        )
+        .route(
+            "/hands/instances/{id}/resume",
+            axum::routing::post(resume_hand),
+        )
+        .route(
+            "/hands/instances/{id}",
+            axum::routing::delete(deactivate_hand),
+        )
+        .route(
+            "/hands/instances/{id}/stats",
+            axum::routing::get(hand_stats),
+        )
+        .route(
+            "/hands/instances/{id}/browser",
+            axum::routing::get(hand_instance_browser),
+        )
+        // MCP server management
+        .route(
+            "/mcp/servers",
+            axum::routing::get(list_mcp_servers).post(add_mcp_server),
+        )
+        .route(
+            "/mcp/servers/{name}",
+            axum::routing::get(get_mcp_server)
+                .put(update_mcp_server)
+                .delete(delete_mcp_server),
+        )
+        // Integrations
+        .route("/integrations", axum::routing::get(list_integrations))
+        .route(
+            "/integrations/available",
+            axum::routing::get(list_available_integrations),
+        )
+        .route("/integrations/add", axum::routing::post(add_integration))
+        .route(
+            "/integrations/{id}",
+            axum::routing::get(get_integration).delete(remove_integration),
+        )
+        .route(
+            "/integrations/{id}/reconnect",
+            axum::routing::post(reconnect_integration),
+        )
+        .route(
+            "/integrations/health",
+            axum::routing::get(integrations_health),
+        )
+        .route(
+            "/integrations/reload",
+            axum::routing::post(reload_integrations),
+        )
+        // Extensions
+        .route("/extensions", axum::routing::get(list_extensions))
+        .route(
+            "/extensions/install",
+            axum::routing::post(install_extension),
+        )
+        .route(
+            "/extensions/uninstall",
+            axum::routing::post(uninstall_extension),
+        )
+        .route("/extensions/{name}", axum::routing::get(get_extension))
+}
+
 use super::channels::FieldType;
 use super::config::json_to_toml_value;
 use super::AppState;
@@ -28,7 +161,7 @@ use std::time::Instant;
     )
 )]
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
     if let Err(e) = registry.load_all() {
         tracing::warn!("Failed to reload skill registry: {e}");
@@ -41,6 +174,9 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
             let source = match &s.manifest.source {
                 Some(librefang_skills::SkillSource::ClawHub { slug, version }) => {
                     serde_json::json!({"type": "clawhub", "slug": slug, "version": version})
+                }
+                Some(librefang_skills::SkillSource::Skillhub { slug, version }) => {
+                    serde_json::json!({"type": "skillhub", "slug": slug, "version": version})
                 }
                 Some(librefang_skills::SkillSource::OpenClaw) => {
                     serde_json::json!({"type": "openclaw"})
@@ -86,7 +222,7 @@ pub async fn install_skill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SkillInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let config = librefang_skills::marketplace::MarketplaceConfig::default();
     let client = librefang_skills::marketplace::MarketplaceClient::new(config);
 
@@ -127,7 +263,7 @@ pub async fn uninstall_skill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SkillUninstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
     if let Err(e) = registry.load_all() {
         tracing::warn!("Failed to reload skill registry: {e}");
@@ -239,7 +375,7 @@ pub async fn clawhub_search(
         }
     }
 
-    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("clawhub");
     let client = librefang_skills::clawhub::ClawHubClient::new(cache_dir);
 
     match client.search(&query, limit).await {
@@ -327,7 +463,7 @@ pub async fn clawhub_browse(
         }
     }
 
-    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("clawhub");
     let client = librefang_skills::clawhub::ClawHubClient::new(cache_dir);
 
     match client.browse(sort, limit, cursor).await {
@@ -378,10 +514,10 @@ pub async fn clawhub_skill_detail(
     State(state): State<Arc<AppState>>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("clawhub");
     let client = librefang_skills::clawhub::ClawHubClient::new(cache_dir);
 
-    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let is_installed = client.is_installed(&slug, &skills_dir);
 
     match client.get_skill(&slug).await {
@@ -404,7 +540,7 @@ pub async fn clawhub_skill_detail(
             let author_image = detail
                 .owner
                 .as_ref()
-                .map(|o| o.image.as_str())
+                .and_then(|o| o.image.as_deref())
                 .unwrap_or("");
 
             (
@@ -453,7 +589,7 @@ pub async fn clawhub_skill_code(
     State(state): State<Arc<AppState>>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("clawhub");
     let client = librefang_skills::clawhub::ClawHubClient::new(cache_dir);
 
     // Try to fetch SKILL.md first, then fallback to package.json
@@ -505,8 +641,8 @@ pub async fn clawhub_install(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::types::ClawHubInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.config.home_dir.join("skills");
-    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let skills_dir = state.kernel.home_dir().join("skills");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("clawhub");
     let client = librefang_skills::clawhub::ClawHubClient::new(cache_dir);
 
     // Check if already installed
@@ -569,6 +705,303 @@ pub async fn clawhub_install(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Skillhub marketplace endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/skillhub/search — Search Skillhub skills.
+pub async fn skillhub_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let query = params.get("q").cloned().unwrap_or_default();
+    if query.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"items": [], "next_cursor": null})),
+        );
+    }
+
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    // Check cache (120s TTL)
+    let cache_key = format!("sh_search:{}:{}", query, limit);
+    if let Some(entry) = state.skillhub_cache.get(&cache_key) {
+        if entry.0.elapsed().as_secs() < 120 {
+            return (StatusCode::OK, Json(entry.1.clone()));
+        }
+    }
+
+    let cache_dir = state
+        .kernel
+        .config_ref()
+        .home_dir
+        .join(".cache")
+        .join("skillhub");
+    let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
+
+    match client.search(&query, limit).await {
+        Ok(results) => {
+            let items: Vec<serde_json::Value> = results
+                .results
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "slug": e.slug,
+                        "name": e.display_name,
+                        "description": e.summary,
+                        "version": e.version,
+                        "score": e.score,
+                        "updated_at": e.updated_at,
+                    })
+                })
+                .collect();
+            let resp = serde_json::json!({
+                "items": items,
+                "next_cursor": null,
+            });
+            state
+                .skillhub_cache
+                .insert(cache_key, (Instant::now(), resp.clone()));
+            (StatusCode::OK, Json(resp))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            tracing::warn!("Skillhub search failed: {msg}");
+            let status = if is_clawhub_rate_limit(&e) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(serde_json::json!({"items": [], "next_cursor": null, "error": msg})),
+            )
+        }
+    }
+}
+
+/// GET /api/skillhub/browse — Browse Skillhub skills from the static index.
+pub async fn skillhub_browse(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let sort = params.get("sort").map(|s| s.as_str()).unwrap_or("trending");
+
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    // Check cache (300s TTL)
+    let cache_key = format!("sh_browse:{}:{}", sort, limit);
+    if let Some(entry) = state.skillhub_cache.get(&cache_key) {
+        if entry.0.elapsed().as_secs() < 300 {
+            return (StatusCode::OK, Json(entry.1.clone()));
+        }
+    }
+
+    let cache_dir = state
+        .kernel
+        .config_ref()
+        .home_dir
+        .join(".cache")
+        .join("skillhub");
+    let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
+
+    match client.browse(sort, limit).await {
+        Ok(results) => {
+            let items: Vec<serde_json::Value> = results
+                .skills
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "slug": e.slug,
+                        "name": e.name,
+                        "description": e.description,
+                        "version": e.version,
+                        "downloads": e.downloads,
+                        "stars": e.stars,
+                        "categories": e.categories,
+                    })
+                })
+                .collect();
+            let resp = serde_json::json!({
+                "items": items,
+            });
+            state
+                .skillhub_cache
+                .insert(cache_key, (Instant::now(), resp.clone()));
+            (StatusCode::OK, Json(resp))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            tracing::warn!("Skillhub browse failed: {msg}");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"items": [], "error": msg})),
+            )
+        }
+    }
+}
+
+/// GET /api/skillhub/skill/{slug} — Get detailed info about a Skillhub skill.
+pub async fn skillhub_skill_detail(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    let cache_dir = state
+        .kernel
+        .config_ref()
+        .home_dir
+        .join(".cache")
+        .join("skillhub");
+    let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
+
+    let skills_dir = state.kernel.config_ref().home_dir.join("skills");
+    let is_installed = client.is_installed(&slug, &skills_dir);
+
+    match client.get_skill(&slug).await {
+        Ok(detail) => {
+            let version = detail
+                .latest_version
+                .as_ref()
+                .map(|v| v.version.as_str())
+                .unwrap_or("");
+            let author = detail
+                .owner
+                .as_ref()
+                .map(|o| o.handle.as_str())
+                .unwrap_or("");
+            let author_name = detail
+                .owner
+                .as_ref()
+                .map(|o| o.display_name.as_str())
+                .unwrap_or("");
+            let author_image = detail
+                .owner
+                .as_ref()
+                .and_then(|o| o.image.as_deref())
+                .unwrap_or("");
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "slug": detail.skill.slug,
+                    "name": detail.skill.display_name,
+                    "description": detail.skill.summary,
+                    "version": version,
+                    "downloads": std::cmp::max(detail.skill.stats.downloads, detail.skill.stats.installs),
+                    "stars": detail.skill.stats.stars,
+                    "author": author,
+                    "author_name": author_name,
+                    "author_image": author_image,
+                    "tags": detail.skill.tags,
+                    "updated_at": detail.skill.updated_at,
+                    "created_at": detail.skill.created_at,
+                    "installed": is_installed,
+                    "source": "skillhub",
+                })),
+            )
+        }
+        Err(e) => {
+            let status = if is_clawhub_rate_limit(&e) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            (status, Json(serde_json::json!({"error": format!("{e}")})))
+        }
+    }
+}
+
+/// GET /api/skillhub/skill/{slug}/code — Source code viewing is not available for Skillhub skills.
+pub async fn skillhub_skill_code(Path(_slug): Path<String>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(
+            serde_json::json!({"error": "Source code viewing is not available for Skillhub skills"}),
+        ),
+    )
+}
+
+/// POST /api/skillhub/install — Install a skill from Skillhub.
+pub async fn skillhub_install(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::types::ClawHubInstallRequest>,
+) -> impl IntoResponse {
+    let skills_dir = state.kernel.config_ref().home_dir.join("skills");
+    let cache_dir = state
+        .kernel
+        .config_ref()
+        .home_dir
+        .join(".cache")
+        .join("skillhub");
+    let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
+
+    // Check if already installed
+    if client.is_installed(&req.slug, &skills_dir) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Skill '{}' is already installed", req.slug),
+                "status": "already_installed",
+            })),
+        );
+    }
+
+    match client.install(&req.slug, &skills_dir).await {
+        Ok(result) => {
+            let warnings: Vec<serde_json::Value> = result
+                .warnings
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "severity": format!("{:?}", w.severity),
+                        "message": w.message,
+                    })
+                })
+                .collect();
+
+            let translations: Vec<serde_json::Value> = result
+                .tool_translations
+                .iter()
+                .map(|(from, to)| serde_json::json!({"from": from, "to": to}))
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "installed",
+                    "name": result.skill_name,
+                    "version": result.version,
+                    "slug": result.slug,
+                    "is_prompt_only": result.is_prompt_only,
+                    "warnings": warnings,
+                    "tool_translations": translations,
+                })),
+            )
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            let status = if matches!(e, librefang_skills::SkillError::SecurityBlocked(_)) {
+                StatusCode::FORBIDDEN
+            } else if is_clawhub_rate_limit(&e) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else if matches!(e, librefang_skills::SkillError::Network(_)) {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            tracing::warn!("Skillhub install failed: {msg}");
+            (status, Json(serde_json::json!({"error": msg})))
+        }
+    }
+}
+
 /// Check whether a SkillError represents a ClawHub rate-limit (429).
 fn is_clawhub_rate_limit(err: &librefang_skills::SkillError) -> bool {
     matches!(err, librefang_skills::SkillError::RateLimited(_))
@@ -615,16 +1048,16 @@ fn server_platform() -> &'static str {
     )
 )]
 pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let defs = state.kernel.hand_registry.list_definitions();
+    let defs = state.kernel.hands().list_definitions();
     let hands: Vec<serde_json::Value> = defs
         .iter()
         .map(|d| {
             let reqs = state
                 .kernel
-                .hand_registry
+                .hands()
                 .check_requirements(&d.id)
                 .unwrap_or_default();
-            let readiness = state.kernel.hand_registry.readiness(&d.id);
+            let readiness = state.kernel.hands().readiness(&d.id);
             let requirements_met = readiness
                 .as_ref()
                 .map(|r| r.requirements_met)
@@ -668,7 +1101,7 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
     )
 )]
 pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let instances = state.kernel.hand_registry.list_instances();
+    let instances = state.kernel.hands().list_instances();
     let items: Vec<serde_json::Value> = instances
         .iter()
         .map(|i| {
@@ -703,14 +1136,14 @@ pub async fn get_hand(
     State(state): State<Arc<AppState>>,
     Path(hand_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.kernel.hand_registry.get_definition(&hand_id) {
+    match state.kernel.hands().get_definition(&hand_id) {
         Some(def) => {
             let reqs = state
                 .kernel
-                .hand_registry
+                .hands()
                 .check_requirements(&hand_id)
                 .unwrap_or_default();
-            let readiness = state.kernel.hand_registry.readiness(&hand_id);
+            let readiness = state.kernel.hands().readiness(&hand_id);
             let requirements_met = readiness
                 .as_ref()
                 .map(|r| r.requirements_met)
@@ -719,7 +1152,7 @@ pub async fn get_hand(
             let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             let settings_status = state
                 .kernel
-                .hand_registry
+                .hands()
                 .check_settings_availability(&hand_id)
                 .unwrap_or_default();
             (
@@ -756,10 +1189,10 @@ pub async fn get_hand(
                         "name": def.agent.name,
                         "description": def.agent.description,
                         "provider": if def.agent.provider == "default" {
-                            &state.kernel.config.default_model.provider
+                            &state.kernel.config_ref().default_model.provider
                         } else { &def.agent.provider },
                         "model": if def.agent.model == "default" {
-                            &state.kernel.config.default_model.model
+                            &state.kernel.config_ref().default_model.model
                         } else { &def.agent.model },
                     },
                     "dashboard": def.dashboard.metrics.iter().map(|m| serde_json::json!({
@@ -795,14 +1228,14 @@ pub async fn check_hand_deps(
     State(state): State<Arc<AppState>>,
     Path(hand_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.kernel.hand_registry.get_definition(&hand_id) {
+    match state.kernel.hands().get_definition(&hand_id) {
         Some(def) => {
             let reqs = state
                 .kernel
-                .hand_registry
+                .hands()
                 .check_requirements(&hand_id)
                 .unwrap_or_default();
-            let readiness = state.kernel.hand_registry.readiness(&hand_id);
+            let readiness = state.kernel.hands().readiness(&hand_id);
             let requirements_met = readiness
                 .as_ref()
                 .map(|r| r.requirements_met)
@@ -860,7 +1293,7 @@ pub async fn install_hand_deps(
     State(state): State<Arc<AppState>>,
     Path(hand_id): Path<String>,
 ) -> impl IntoResponse {
-    let def = match state.kernel.hand_registry.get_definition(&hand_id) {
+    let def = match state.kernel.hands().get_definition(&hand_id) {
         Some(d) => d.clone(),
         None => {
             return (
@@ -872,7 +1305,7 @@ pub async fn install_hand_deps(
 
     let reqs = state
         .kernel
-        .hand_registry
+        .hands()
         .check_requirements(&hand_id)
         .unwrap_or_default();
 
@@ -1069,7 +1502,7 @@ pub async fn install_hand_deps(
     // Re-check requirements after installation
     let reqs_after = state
         .kernel
-        .hand_registry
+        .hands()
         .check_requirements(&hand_id)
         .unwrap_or_default();
     let all_satisfied = reqs_after.iter().all(|(_, ok)| *ok);
@@ -1115,8 +1548,8 @@ pub async fn install_hand(
         );
     }
 
-    match state.kernel.hand_registry.install_from_content_persisted(
-        &state.kernel.config.home_dir,
+    match state.kernel.hands().install_from_content_persisted(
+        state.kernel.home_dir(),
         toml_content,
         skill_content,
     ) {
@@ -1166,7 +1599,7 @@ pub async fn activate_hand(
             if let Some(agent_id) = instance.agent_id {
                 let entry = state
                     .kernel
-                    .registry
+                    .agent_registry()
                     .list()
                     .into_iter()
                     .find(|e| e.id == agent_id);
@@ -1302,11 +1735,7 @@ pub async fn get_hand_settings(
     State(state): State<Arc<AppState>>,
     Path(hand_id): Path<String>,
 ) -> impl IntoResponse {
-    let settings_status = match state
-        .kernel
-        .hand_registry
-        .check_settings_availability(&hand_id)
-    {
+    let settings_status = match state.kernel.hands().check_settings_availability(&hand_id) {
         Ok(s) => s,
         Err(_) => {
             return (
@@ -1319,7 +1748,7 @@ pub async fn get_hand_settings(
     // Find active instance config values (if any)
     let instance_config: std::collections::HashMap<String, serde_json::Value> = state
         .kernel
-        .hand_registry
+        .hands()
         .list_instances()
         .iter()
         .find(|i| i.hand_id == hand_id)
@@ -1357,14 +1786,14 @@ pub async fn update_hand_settings(
     // Find active instance for this hand
     let instance_id = state
         .kernel
-        .hand_registry
+        .hands()
         .list_instances()
         .iter()
         .find(|i| i.hand_id == hand_id)
         .map(|i| i.instance_id);
 
     match instance_id {
-        Some(id) => match state.kernel.hand_registry.update_config(id, config.clone()) {
+        Some(id) => match state.kernel.hands().update_config(id, config.clone()) {
             Ok(()) => (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1404,7 +1833,7 @@ pub async fn hand_stats(
     State(state): State<Arc<AppState>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
-    let instance = match state.kernel.hand_registry.get_instance(id) {
+    let instance = match state.kernel.hands().get_instance(id) {
         Some(i) => i,
         None => {
             return (
@@ -1414,7 +1843,7 @@ pub async fn hand_stats(
         }
     };
 
-    let def = match state.kernel.hand_registry.get_definition(&instance.hand_id) {
+    let def = match state.kernel.hands().get_definition(&instance.hand_id) {
         Some(d) => d,
         None => {
             return (
@@ -1443,7 +1872,7 @@ pub async fn hand_stats(
     for metric in &def.dashboard.metrics {
         let value = state
             .kernel
-            .memory
+            .memory_substrate()
             .structured_get(agent_id, &metric.memory_key)
             .ok()
             .flatten()
@@ -1486,7 +1915,7 @@ pub async fn hand_instance_browser(
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     // 1. Look up instance
-    let instance = match state.kernel.hand_registry.get_instance(id) {
+    let instance = match state.kernel.hands().get_instance(id) {
         Some(i) => i,
         None => {
             return (
@@ -1507,7 +1936,7 @@ pub async fn hand_instance_browser(
     let agent_id_str = agent_id.to_string();
 
     // 3. Check if a browser session exists (without creating one)
-    if !state.kernel.browser_ctx.has_session(&agent_id_str) {
+    if !state.kernel.browser().has_session(&agent_id_str) {
         return (StatusCode::OK, Json(serde_json::json!({"active": false})));
     }
 
@@ -1518,7 +1947,7 @@ pub async fn hand_instance_browser(
 
     match state
         .kernel
-        .browser_ctx
+        .browser()
         .send_command(
             &agent_id_str,
             librefang_runtime::browser::BrowserCommand::ReadPage,
@@ -1548,7 +1977,7 @@ pub async fn hand_instance_browser(
 
     match state
         .kernel
-        .browser_ctx
+        .browser()
         .send_command(
             &agent_id_str,
             librefang_runtime::browser::BrowserCommand::Screenshot,
@@ -1662,7 +2091,7 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
     // Get configured servers from config
     let config_servers: Vec<serde_json::Value> = state
         .kernel
-        .config
+        .config_ref()
         .mcp_servers
         .iter()
         .map(|s| {
@@ -1677,7 +2106,7 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
         .collect();
 
     // Get connected servers and their tools from the live MCP connections
-    let connections = state.kernel.mcp_connections.lock().await;
+    let connections = state.kernel.mcp_connections_ref().lock().await;
     let connected: Vec<serde_json::Value> = connections
         .iter()
         .map(|conn| {
@@ -1731,7 +2160,7 @@ pub async fn get_mcp_server(
     // Find the configured entry by name
     let entry = state
         .kernel
-        .config
+        .config_ref()
         .mcp_servers
         .iter()
         .find(|s| s.name == name);
@@ -1757,7 +2186,7 @@ pub async fn get_mcp_server(
     });
 
     // Check live connection status
-    let connections = state.kernel.mcp_connections.lock().await;
+    let connections = state.kernel.mcp_connections_ref().lock().await;
     if let Some(conn) = connections.iter().find(|c| c.name() == name) {
         let tools: Vec<serde_json::Value> = conn
             .tools()
@@ -1828,7 +2257,7 @@ pub async fn add_mcp_server(
     // Check for duplicate name
     if state
         .kernel
-        .config
+        .config_ref()
         .mcp_servers
         .iter()
         .any(|s| s.name == name)
@@ -1840,7 +2269,7 @@ pub async fn add_mcp_server(
     }
 
     // Persist to config.toml
-    let config_path = state.kernel.config.home_dir.join("config.toml");
+    let config_path = state.kernel.home_dir().join("config.toml");
     if let Err(e) = upsert_mcp_server_config(&config_path, &entry) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1860,7 +2289,7 @@ pub async fn add_mcp_server(
         Err(_) => "saved_reload_failed",
     };
 
-    state.kernel.audit_log.record(
+    state.kernel.audit().record(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         format!("mcp_server added: {name}"),
@@ -1904,7 +2333,7 @@ pub async fn update_mcp_server(
     // Ensure the entry exists
     if !state
         .kernel
-        .config
+        .config_ref()
         .mcp_servers
         .iter()
         .any(|s| s.name == name)
@@ -1943,7 +2372,7 @@ pub async fn update_mcp_server(
     };
 
     // Persist — upsert replaces an existing entry with the same name
-    let config_path = state.kernel.config.home_dir.join("config.toml");
+    let config_path = state.kernel.home_dir().join("config.toml");
     if let Err(e) = upsert_mcp_server_config(&config_path, &entry) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1964,7 +2393,7 @@ pub async fn update_mcp_server(
         Err(_) => "saved_reload_failed",
     };
 
-    state.kernel.audit_log.record(
+    state.kernel.audit().record(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         format!("mcp_server updated: {name}"),
@@ -2002,7 +2431,7 @@ pub async fn delete_mcp_server(
     // Ensure the entry exists
     if !state
         .kernel
-        .config
+        .config_ref()
         .mcp_servers
         .iter()
         .any(|s| s.name == name)
@@ -2015,7 +2444,7 @@ pub async fn delete_mcp_server(
         );
     }
 
-    let config_path = state.kernel.config.home_dir.join("config.toml");
+    let config_path = state.kernel.home_dir().join("config.toml");
     if let Err(e) = remove_mcp_server_config(&config_path, &name) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2036,7 +2465,7 @@ pub async fn delete_mcp_server(
         Err(_) => "saved_reload_failed",
     };
 
-    state.kernel.audit_log.record(
+    state.kernel.audit().record(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         format!("mcp_server removed: {name}"),
@@ -2205,7 +2634,7 @@ pub async fn create_skill(
     }
 
     // Write skill.toml to ~/.librefang/skills/{name}/
-    let skill_dir = state.kernel.config.home_dir.join("skills").join(&name);
+    let skill_dir = state.kernel.home_dir().join("skills").join(&name);
     if skill_dir.exists() {
         return (
             StatusCode::CONFLICT,
@@ -2508,10 +2937,10 @@ fn integration_status_str(
 pub async fn list_integrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state
         .kernel
-        .extension_registry
+        .extensions()
         .read()
         .unwrap_or_else(|e| e.into_inner());
-    let health = &state.kernel.extension_health;
+    let health = &state.kernel.extension_monitor();
 
     let mut entries = Vec::new();
     for info in registry.list_all_info() {
@@ -2556,10 +2985,10 @@ pub async fn get_integration(
 ) -> impl IntoResponse {
     let registry = state
         .kernel
-        .extension_registry
+        .extensions()
         .read()
         .unwrap_or_else(|e| e.into_inner());
-    let health = &state.kernel.extension_health;
+    let health = &state.kernel.extension_monitor();
 
     // Look up the template first
     let template = match registry.get_template(&id) {
@@ -2624,7 +3053,7 @@ pub async fn get_integration(
 pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state
         .kernel
-        .extension_registry
+        .extensions()
         .read()
         .unwrap_or_else(|e| e.into_inner());
     let templates: Vec<serde_json::Value> = registry
@@ -2687,7 +3116,7 @@ pub async fn add_integration(
     let install_err = {
         let mut registry = state
             .kernel
-            .extension_registry
+            .extensions()
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -2720,7 +3149,7 @@ pub async fn add_integration(
         return (status, Json(serde_json::json!({"error": error})));
     }
 
-    state.kernel.extension_health.register(&id);
+    state.kernel.extension_monitor().register(&id);
 
     // Hot-connect the new MCP server
     let connected = state.kernel.reload_extension_mcps().await.unwrap_or(0);
@@ -2756,7 +3185,7 @@ pub async fn remove_integration(
     let uninstall_err = {
         let mut registry = state
             .kernel
-            .extension_registry
+            .extensions()
             .write()
             .unwrap_or_else(|e| e.into_inner());
         registry.uninstall(&id).err()
@@ -2769,7 +3198,7 @@ pub async fn remove_integration(
         );
     }
 
-    state.kernel.extension_health.unregister(&id);
+    state.kernel.extension_monitor().unregister(&id);
 
     // Hot-disconnect the removed MCP server
     if let Err(e) = state.kernel.reload_extension_mcps().await {
@@ -2804,7 +3233,7 @@ pub async fn reconnect_integration(
     let is_installed = {
         let registry = state
             .kernel
-            .extension_registry
+            .extensions()
             .read()
             .unwrap_or_else(|e| e.into_inner());
         registry.is_installed(&id)
@@ -2847,7 +3276,7 @@ pub async fn reconnect_integration(
     )
 )]
 pub async fn integrations_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let health_entries = state.kernel.extension_health.all_health();
+    let health_entries = state.kernel.extension_monitor().all_health();
     let entries: Vec<serde_json::Value> = health_entries
         .iter()
         .map(|h| {
@@ -2912,10 +3341,10 @@ pub async fn reload_integrations(State(state): State<Arc<AppState>>) -> impl Int
 pub async fn list_extensions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state
         .kernel
-        .extension_registry
+        .extensions()
         .read()
         .unwrap_or_else(|e| e.into_inner());
-    let health = &state.kernel.extension_health;
+    let health = &state.kernel.extension_monitor();
 
     let mut extensions = Vec::new();
     for info in registry.list_all_info() {
@@ -2967,7 +3396,7 @@ pub async fn get_extension(
 ) -> impl IntoResponse {
     let registry = state
         .kernel
-        .extension_registry
+        .extensions()
         .read()
         .unwrap_or_else(|e| e.into_inner());
 
@@ -2982,7 +3411,7 @@ pub async fn get_extension(
     };
 
     let installed = registry.get_installed(&name).cloned();
-    let health = state.kernel.extension_health.get_health(&name);
+    let health = state.kernel.extension_monitor().get_health(&name);
 
     let status = match &installed {
         Some(inst) if !inst.enabled => "disabled",
@@ -3052,7 +3481,7 @@ pub async fn install_extension(
     let install_err = {
         let mut registry = state
             .kernel
-            .extension_registry
+            .extensions()
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -3085,7 +3514,7 @@ pub async fn install_extension(
         return (status, Json(serde_json::json!({"error": error})));
     }
 
-    state.kernel.extension_health.register(&name);
+    state.kernel.extension_monitor().register(&name);
 
     // Hot-connect the new MCP server
     let connected = state.kernel.reload_extension_mcps().await.unwrap_or(0);
@@ -3126,7 +3555,7 @@ pub async fn uninstall_extension(
     let uninstall_err = {
         let mut registry = state
             .kernel
-            .extension_registry
+            .extensions()
             .write()
             .unwrap_or_else(|e| e.into_inner());
         registry.uninstall(&name).err()
@@ -3139,7 +3568,7 @@ pub async fn uninstall_extension(
         );
     }
 
-    state.kernel.extension_health.unregister(&name);
+    state.kernel.extension_monitor().unregister(&name);
 
     // Hot-disconnect the removed MCP server
     if let Err(e) = state.kernel.reload_extension_mcps().await {

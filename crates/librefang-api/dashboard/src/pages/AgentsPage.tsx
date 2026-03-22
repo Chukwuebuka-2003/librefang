@@ -11,7 +11,7 @@ import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { Badge } from "../components/ui/Badge";
 import { Avatar } from "../components/ui/Avatar";
-import { Search, Users, MessageCircle, X, Cpu, Wrench, Shield, Plus, Loader2, Pause, Play, Clock } from "lucide-react";
+import { Search, Users, MessageCircle, X, Cpu, Wrench, Shield, Plus, Loader2, Pause, Play, Clock, Brain, Zap } from "lucide-react";
 
 const REFRESH_MS = 30000;
 
@@ -50,7 +50,7 @@ export function AgentsPage() {
   const filteredAgents = agents
     .filter(a => a.name.toLowerCase().includes(search.toLowerCase()) || a.id.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => {
-      // 1. Suspended last
+      // 1. Suspended agents last
       const aSusp = (a.state || "").toLowerCase() === "suspended" ? 1 : 0;
       const bSusp = (b.state || "").toLowerCase() === "suspended" ? 1 : 0;
       if (aSusp !== bSusp) return aSusp - bSusp;
@@ -62,7 +62,7 @@ export function AgentsPage() {
       return a.name.localeCompare(b.name);
     });
 
-  // 分组：core agents 和 hands
+  // Group: core agents and hands
   const coreAgents = filteredAgents.filter(a => !a.name.includes("-hand"));
   const handAgents = filteredAgents.filter(a => a.name.includes("-hand"));
 
@@ -125,8 +125,8 @@ export function AgentsPage() {
   };
 
   return (
-    <div className="flex flex-col gap-6 transition-colors duration-300">
-      <div className="flex justify-between items-end">
+    <div className="flex flex-col gap-4 sm:gap-6 transition-colors duration-300">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-end gap-3">
         <PageHeader
           badge={t("common.kernel_runtime")}
           title={t("agents.title")}
@@ -135,7 +135,7 @@ export function AgentsPage() {
           onRefresh={() => void agentsQuery.refetch()}
           icon={<Users className="h-4 w-4" />}
         />
-        <Button variant="primary" onClick={() => setShowCreate(true)}>
+        <Button variant="primary" onClick={() => setShowCreate(true)} className="shrink-0">
           <Plus className="w-4 h-4" />
           {t("agents.create_agent")}
         </Button>
@@ -184,7 +184,7 @@ export function AgentsPage() {
                   const isSuspended = (agent.state || "").toLowerCase() === "suspended";
                   return (
                     <div key={agent.id}
-                      className={`flex items-center gap-4 p-4 rounded-2xl border border-border-subtle hover:border-brand/30 transition-all cursor-pointer ${isSuspended ? "opacity-60 hover:opacity-100" : "bg-surface"}`}
+                      className={`flex items-center gap-3 sm:gap-4 p-3 sm:p-4 rounded-xl sm:rounded-2xl border border-border-subtle hover:border-brand/30 transition-all cursor-pointer ${isSuspended ? "opacity-60 hover:opacity-100" : "bg-surface"}`}
                       onClick={async () => {
                         setDetailLoading(true);
                         try { const d = await getAgentDetail(agent.id); setDetailAgent(d); } catch { setDetailAgent({ name: agent.name, id: agent.id }); }
@@ -192,27 +192,27 @@ export function AgentsPage() {
                       }}>
                       <Avatar fallback={agent.name} size="md" />
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-sm font-bold truncate">{agent.name}</h3>
-                          <span className="text-[8px] px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400 font-bold">{t("agents.hand_badge")}</span>
+                        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                          <h3 className="text-xs sm:text-sm font-bold truncate">{agent.name}</h3>
+                          <span className="text-[8px] px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400 font-bold hidden sm:inline">{t("agents.hand_badge")}</span>
                           <Badge variant={getStatusVariant(agent.state)}>
                             {agent.state ? t(`common.${agent.state.toLowerCase()}`, { defaultValue: agent.state }) : t("common.idle")}
                           </Badge>
                         </div>
-                        <div className="flex items-center gap-3 mt-1 text-[10px] text-text-dim/60">
+                        <div className="flex items-center gap-2 sm:gap-3 mt-0.5 sm:mt-1 text-[9px] sm:text-[10px] text-text-dim/60">
                           <span className="font-mono">{agent.id.slice(0, 8)}</span>
-                          <span>{agent.model_name || t("common.unknown")}</span>
+                          <span className="hidden sm:inline">{agent.model_name || t("common.unknown")}</span>
                           <span className="text-brand">{agent.model_provider}</span>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 shrink-0" onClick={e => e.stopPropagation()}>
+                      <div className="flex items-center gap-1 sm:gap-2 shrink-0" onClick={e => e.stopPropagation()}>
                         {isSuspended ? (
                           <Button variant="secondary" size="sm" onClick={async () => { await resumeAgent(agent.id); agentsQuery.refetch(); }}>
-                            <Play className="h-3.5 w-3.5 mr-1" /> {t("agents.resume")}
+                            <Play className="h-3.5 w-3.5 mr-1" /> <span className="hidden sm:inline">{t("agents.resume")}</span>
                           </Button>
                         ) : (
                           <Button variant="secondary" size="sm" onClick={async () => { await suspendAgent(agent.id); agentsQuery.refetch(); }}>
-                            <Pause className="h-3.5 w-3.5 mr-1" /> {t("agents.suspend")}
+                            <Pause className="h-3.5 w-3.5 mr-1" /> <span className="hidden sm:inline">{t("agents.suspend")}</span>
                           </Button>
                         )}
                         <Button variant="primary" size="sm" onClick={() => navigate({ to: "/chat", search: { agentId: agent.id } })}>
@@ -229,8 +229,8 @@ export function AgentsPage() {
       )}
       {/* Agent Detail Modal */}
       {detailAgent && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xl backdrop-saturate-150" onClick={() => setDetailAgent(null)}>
-          <div className="bg-surface rounded-2xl shadow-2xl border border-border-subtle w-[560px] max-w-[90vw] max-h-[80vh] overflow-y-auto animate-fade-in-scale" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-xl backdrop-saturate-150" onClick={() => setDetailAgent(null)}>
+          <div className="bg-surface rounded-t-2xl sm:rounded-2xl shadow-2xl border border-border-subtle w-full sm:w-[560px] sm:max-w-[90vw] max-h-[85vh] sm:max-h-[80vh] overflow-y-auto animate-fade-in-scale" onClick={e => e.stopPropagation()}>
             {/* Modal Header */}
             <div className="px-6 py-5 border-b border-border-subtle sticky top-0 bg-surface/95 backdrop-blur-xl backdrop-saturate-150 z-10">
               <div className="flex items-center justify-between">
@@ -317,6 +317,38 @@ export function AgentsPage() {
                 </div>
               )}
 
+              {/* Thinking / Extended Reasoning */}
+              {detailAgent.thinking && (
+                <div>
+                  <h4 className="text-[10px] font-black text-text-dim uppercase tracking-widest mb-3 flex items-center gap-2">
+                    <div className="w-5 h-5 rounded bg-purple-500/10 flex items-center justify-center"><Brain className="w-3 h-3 text-purple-500" /></div>
+                    {t("agents.thinking")}
+                  </h4>
+                  <div className="p-4 rounded-xl bg-main/50 border border-border-subtle/50 space-y-2.5 text-xs">
+                    <div className="flex justify-between items-center">
+                      <span className="text-text-dim">{t("agents.thinking_enabled")}</span>
+                      <Badge variant={detailAgent.thinking.budget_tokens > 0 ? "success" : "default"}>
+                        {detailAgent.thinking.budget_tokens > 0 ? t("common.yes") : t("common.no")}
+                      </Badge>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-text-dim">{t("agents.budget_tokens")}</span>
+                      <span className="font-black text-sm">{detailAgent.thinking.budget_tokens?.toLocaleString() ?? 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-text-dim">{t("agents.stream_thinking")}</span>
+                      <Badge variant={detailAgent.thinking.stream_thinking ? "brand" : "default"}>
+                        {detailAgent.thinking.stream_thinking ? t("common.yes") : t("common.no")}
+                      </Badge>
+                    </div>
+                    <p className="text-[10px] text-text-dim/50 flex items-center gap-1 pt-1">
+                      <Zap className="w-3 h-3" />
+                      {t("agents.thinking_hint")}
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {/* Actions */}
               <div className="flex gap-2 pt-2 border-t border-border-subtle">
                 <Button variant="primary" size="sm" className="flex-1" onClick={() => { setDetailAgent(null); navigate({ to: "/chat", search: { agentId: detailAgent.id } }); }}>
@@ -331,8 +363,8 @@ export function AgentsPage() {
 
       {/* Create Agent Modal */}
       {showCreate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-xl backdrop-saturate-150" onClick={() => setShowCreate(false)}>
-          <div className="bg-surface rounded-2xl shadow-2xl border border-border-subtle w-[480px] max-w-[90vw] animate-fade-in-scale" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/30 backdrop-blur-xl backdrop-saturate-150" onClick={() => setShowCreate(false)}>
+          <div className="bg-surface rounded-t-2xl sm:rounded-2xl shadow-2xl border border-border-subtle w-full sm:w-[480px] sm:max-w-[90vw] animate-fade-in-scale" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between px-5 py-3 border-b border-border-subtle">
               <h3 className="text-sm font-bold">{t("agents.create_agent")}</h3>
               <button onClick={() => setShowCreate(false)} className="p-1 rounded hover:bg-main"><X className="w-4 h-4" /></button>
@@ -362,9 +394,13 @@ export function AgentsPage() {
                 <div>
                   <label className="text-[10px] font-bold text-text-dim uppercase">{t("agents.manifest_toml")}</label>
                   <textarea value={manifestToml} onChange={e => setManifestToml(e.target.value)}
-                    placeholder={'[agent]\nname = "my-agent"\n\n[model]\nprovider = "openai"\nmodel = "gpt-4o"'}
-                    rows={10}
+                    placeholder={'[agent]\nname = "my-agent"\n\n[model]\nprovider = "openai"\nmodel = "gpt-4o"\n\n[thinking]\nbudget_tokens = 10000\nstream_thinking = false'}
+                    rows={12}
                     className="mt-1 w-full rounded-xl border border-border-subtle bg-main px-3 py-2 text-xs font-mono outline-none focus:border-brand resize-none" />
+                  <p className="text-[9px] text-text-dim/50 mt-1 flex items-center gap-1">
+                    <Brain className="w-3 h-3" />
+                    {t("agents.thinking_toml_hint")}
+                  </p>
                 </div>
               )}
 

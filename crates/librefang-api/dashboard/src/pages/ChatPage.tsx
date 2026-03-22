@@ -1,12 +1,18 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, useCallback } from "react";
 import Markdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { useTranslation } from "react-i18next";
 import { useSearch } from "@tanstack/react-router";
-import { listAgents, sendAgentMessage, loadAgentSession } from "../api";
-import { MessageCircle, Send, Bot, User, RefreshCw, AlertCircle, Wifi, Sparkles, X, ArrowRight, Zap } from "lucide-react";
+import { listAgents, sendAgentMessage, loadAgentSession, listPendingApprovals, resolveApproval } from "../api";
+import type { ApprovalItem } from "../api";
+import { normalizeToolOutput } from "../lib/chat";
+import { MessageCircle, Send, Bot, User, RefreshCw, AlertCircle, Wifi, Sparkles, X, ArrowRight, Zap, ShieldAlert, CheckCircle, XCircle } from "lucide-react";
 import { Badge } from "../components/ui/Badge";
+import { useUIStore } from "../lib/store";
+import "katex/dist/katex.min.css";
 
 interface ChatMessage {
   id: string;
@@ -21,7 +27,7 @@ interface ChatMessage {
   memories_used?: string[];
 }
 
-// Slash 命令
+// Slash commands
 const SLASH_COMMANDS = [
   { cmd: "/help", desc: "Show available commands" },
   { cmd: "/clear", desc: "Clear chat history" },
@@ -29,7 +35,7 @@ const SLASH_COMMANDS = [
   { cmd: "/info", desc: "Show current agent info" },
 ];
 
-// Markdown 样式
+// Markdown styles
 const mdComponents = {
   p: ({ children }: any) => <p className="mb-2 last:mb-0">{children}</p>,
   h1: ({ children }: any) => <h1 className="text-lg font-bold mb-2">{children}</h1>,
@@ -38,9 +44,13 @@ const mdComponents = {
   ul: ({ children }: any) => <ul className="list-disc pl-4 mb-2 space-y-0.5">{children}</ul>,
   ol: ({ children }: any) => <ol className="list-decimal pl-4 mb-2 space-y-0.5">{children}</ol>,
   li: ({ children }: any) => <li className="text-sm">{children}</li>,
-  code: ({ inline, children }: any) => inline
-    ? <code className="px-1 py-0.5 rounded bg-main font-mono text-[11px]">{children}</code>
-    : <pre className="p-2 rounded-lg bg-main font-mono text-[11px] overflow-x-auto mb-2"><code>{children}</code></pre>,
+  code: ({ node, children, ...props }: any) => {
+    const isBlock = node?.position?.start?.line !== node?.position?.end?.line || String(children).includes("\n");
+    return isBlock
+      ? <pre className="p-2 rounded-lg bg-main font-mono text-[11px] overflow-x-auto mb-2"><code>{children}</code></pre>
+      : <code className="px-1 py-0.5 rounded bg-main font-mono text-[11px]" {...props}>{children}</code>;
+  },
+  pre: ({ children }: any) => <>{children}</>,
   table: ({ children }: any) => <table className="w-full text-xs border-collapse mb-2">{children}</table>,
   th: ({ children }: any) => <th className="border border-border-subtle px-2 py-1 bg-main font-bold text-left">{children}</th>,
   td: ({ children }: any) => <td className="border border-border-subtle px-2 py-1">{children}</td>,
@@ -49,7 +59,7 @@ const mdComponents = {
   a: ({ href, children }: any) => <a href={href} className="text-brand underline" target="_blank" rel="noopener noreferrer">{children}</a>,
 };
 
-// 流式打字机效果 + Markdown
+// Streaming typewriter effect + Markdown
 function Typewriter({ text, speed = 15 }: { text: string; speed?: number }) {
   const [displayed, setDisplayed] = useState("");
   const done = displayed.length >= text.length;
@@ -72,7 +82,15 @@ function Typewriter({ text, speed = 15 }: { text: string; speed?: number }) {
   }, [text, speed]);
 
   if (done) {
-    return <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>{text}</Markdown>;
+    return (
+      <Markdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+        components={mdComponents}
+      >
+        {text}
+      </Markdown>
+    );
   }
   return <span>{displayed}</span>;
 }
@@ -124,13 +142,14 @@ function useWebSocket(agentId: string | null) {
   return { ws: wsRef, wsConnected };
 }
 
-// 聊天消息管理 - 包含历史加载和发送 (with WS streaming)
+// Chat message management - includes history loading and sending (with WS streaming)
 function useChatMessages(agentId: string | null, agents: any[] = []) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const { ws, wsConnected } = useWebSocket(agentId);
+  const addSkillOutput = useUIStore((s) => s.addSkillOutput);
 
-  // 加载历史记录
+  // Load history
   useEffect(() => {
     if (!agentId) return;
     loadAgentSession(agentId)
@@ -148,12 +167,12 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
       .catch(() => {});
   }, [agentId]);
 
-  // 发送消息 - WS优先，HTTP回退
+  // Send message - WS first, HTTP fallback
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim()) return;
     const trimmed = content.trim();
 
-    // Slash 命令处理
+    // Slash command handling
     if (trimmed.startsWith("/")) {
       const sysMsg = (text: string) => {
         setMessages(prev => [...prev,
@@ -211,6 +230,12 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
               setMessages(prev => prev.map(m =>
                 m.id === botMsg.id ? { ...m, content: m.content + chunk } : m
               ));
+            } else if (data.type === "tool_result") {
+              // Persist tool output for display
+              const entry = normalizeToolOutput(data);
+              if (entry) {
+                addSkillOutput({ skillName: entry.tool, agentId: agentId || undefined, content: entry.content });
+              }
             } else if (data.type === "done" || data.done) {
               // Stream complete
               setMessages(prev => prev.map(m =>
@@ -303,6 +328,13 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
                 }
               : m
           ));
+          // Persist skill outputs
+          if (response.memories_saved?.length) {
+            const agentName = agents.find(a => a.id === agentId)?.name;
+            response.memories_saved.forEach((mem: string) => {
+              addSkillOutput({ skillName: "memory", agentId: agentId || undefined, agentName, content: mem });
+            });
+          }
           setIsLoading(false);
         }
       }, 20);
@@ -320,7 +352,7 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
   return { messages, isLoading, sendMessage, clearHistory, wsConnected };
 }
 
-// 消息气泡组件
+// Message bubble component
 function MessageBubble({ message }: { message: ChatMessage }) {
   const { t } = useTranslation();
   const isUser = message.role === "user";
@@ -339,8 +371,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} animate-fade-in-up`}>
-      <div className={`flex flex-col max-w-[75%] ${isUser ? "items-end" : "items-start"}`}>
-        {/* 头像 + 名字 */}
+      <div className={`flex flex-col max-w-[90%] sm:max-w-[75%] ${isUser ? "items-end" : "items-start"}`}>
+        {/* Avatar + name */}
         <div className={`flex items-center gap-2 mb-1.5 ${isUser ? "self-end flex-row-reverse" : "self-start"}`}>
           <div className={`h-7 w-7 rounded-lg flex items-center justify-center ${
             isUser ? "bg-gradient-to-br from-brand to-accent text-white shadow-md" : "bg-surface border border-border-subtle"
@@ -352,7 +384,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           </span>
         </div>
 
-        {/* 消息内容 */}
+        {/* Message content */}
         <div className={`relative px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm transition-all ${
           isUser
             ? "bg-gradient-to-br from-brand to-brand/90 text-white rounded-tr-md"
@@ -376,7 +408,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           )}
         </div>
 
-        {/* 元信息 */}
+        {/* Meta info */}
         <div className="flex items-center gap-2 mt-1.5 text-[10px] text-text-dim/50">
           <span>{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
           {message.tokens?.output && !message.isStreaming && (
@@ -404,7 +436,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   );
 }
 
-// 输入框 - 带快捷键提示
+// Input box - with shortcut hints
 function ChatInput({ onSend, disabled, placeholder }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string }) {
   const { t } = useTranslation();
   const [message, setMessage] = useState("");
@@ -430,7 +462,7 @@ function ChatInput({ onSend, disabled, placeholder }: { onSend: (msg: string) =>
 
   return (
     <form onSubmit={handleSubmit} className="space-y-2">
-      {/* Slash 命令补全 */}
+      {/* Slash command autocomplete */}
       {showingSlash && filteredCmds.length > 0 && (
         <div className="rounded-xl border border-border-subtle bg-surface shadow-lg p-1 mb-1">
           {filteredCmds.map(c => (
@@ -443,7 +475,7 @@ function ChatInput({ onSend, disabled, placeholder }: { onSend: (msg: string) =>
           ))}
         </div>
       )}
-      <div className="flex gap-3 items-end">
+      <div className="flex gap-2 sm:gap-3 items-end">
         <div className="flex-1">
           <textarea
             ref={textareaRef}
@@ -458,16 +490,16 @@ function ChatInput({ onSend, disabled, placeholder }: { onSend: (msg: string) =>
             placeholder={placeholder}
             disabled={disabled}
             rows={1}
-            className="w-full min-h-[52px] max-h-[150px] rounded-2xl border border-border-subtle bg-surface px-5 py-3.5 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none placeholder:text-text-dim/40 shadow-sm"
+            className="w-full min-h-[44px] sm:min-h-[52px] max-h-[150px] rounded-2xl border border-border-subtle bg-surface px-3 sm:px-5 py-2.5 sm:py-3.5 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none placeholder:text-text-dim/40 shadow-sm"
           />
         </div>
         <button
           type="submit"
           disabled={!message.trim() || disabled}
-          className="group relative px-5 py-3.5 rounded-2xl bg-gradient-to-r from-brand to-brand/90 text-white font-bold text-sm shadow-lg shadow-brand/20 hover:shadow-brand/40 hover:-translate-y-0.5 transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:translate-y-0"
+          className="group relative px-3.5 sm:px-5 py-2.5 sm:py-3.5 rounded-2xl bg-gradient-to-r from-brand to-brand/90 text-white font-bold text-sm shadow-lg shadow-brand/20 hover:shadow-brand/40 hover:-translate-y-0.5 transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:translate-y-0"
         >
           <Send className="h-4 w-4" />
-          <span className="absolute -top-8 right-0 bg-surface border border-border-subtle rounded-lg px-2 py-1 text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
+          <span className="absolute -top-8 right-0 bg-surface border border-border-subtle rounded-lg px-2 py-1 text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap hidden sm:block">
             {t("chat.send_hint")}
           </span>
         </button>
@@ -476,25 +508,25 @@ function ChatInput({ onSend, disabled, placeholder }: { onSend: (msg: string) =>
   );
 }
 
-// 连接状态栏
+// Connection status bar
 function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnected }: { agentName: string; isLoading: boolean; messageCount: number; onClear: () => void; wsConnected?: boolean }) {
   const { t } = useTranslation();
   return (
-    <div className="px-4 py-2.5 border-b border-border-subtle/50 bg-gradient-to-r from-surface/80 to-transparent flex items-center justify-between backdrop-blur-xl backdrop-saturate-150">
-      <div className="flex items-center gap-3">
+    <div className="px-2 sm:px-4 py-2 sm:py-2.5 border-b border-border-subtle/50 bg-gradient-to-r from-surface/80 to-transparent flex items-center justify-between backdrop-blur-xl backdrop-saturate-150">
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
         <div className="relative">
           <Wifi className="h-3.5 w-3.5 text-success" />
           <span className="absolute inset-0 rounded-full bg-success/30 animate-ping" />
         </div>
-        <span className="text-xs font-semibold text-success uppercase tracking-wide">{t("chat.secure_link")}</span>
+        <span className="text-xs font-semibold text-success uppercase tracking-wide hidden sm:inline">{t("chat.secure_link")}</span>
         {wsConnected && (
           <Badge variant="brand" dot>
             <Zap className="h-2.5 w-2.5 mr-0.5" />
             {t("chat.ws_connected")}
           </Badge>
         )}
-        <span className="text-text-dim/30">&bull;</span>
-        <span className="text-xs font-medium text-text-dim">{agentName}</span>
+        <span className="text-text-dim/30 hidden sm:inline">&bull;</span>
+        <span className="text-xs font-medium text-text-dim truncate">{agentName}</span>
         {isLoading && (
           <span className="ml-2 px-2 py-0.5 rounded-full bg-brand/10 text-brand text-[10px] font-medium animate-pulse">
             {wsConnected ? t("chat.ws_streaming") : t("chat.generating")}
@@ -507,6 +539,141 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnecte
           {t("chat.clear_chat")}
         </button>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Approval polling — polls pending approvals for the current agent
+// ---------------------------------------------------------------------------
+const APPROVAL_POLL_MS = 2000;
+
+function useApprovalPoller(agentId: string | null) {
+  const [pendingApprovals, setPendingApprovals] = useState<ApprovalItem[]>([]);
+
+  useEffect(() => {
+    if (!agentId) {
+      setPendingApprovals([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const items = await listPendingApprovals(agentId);
+        if (!cancelled) setPendingApprovals(items);
+      } catch {
+        // Silently ignore — API may be temporarily unavailable
+      }
+    };
+
+    poll();
+    const timer = setInterval(poll, APPROVAL_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [agentId]);
+
+  const remove = useCallback((id: string) => {
+    setPendingApprovals((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  return { pendingApprovals, removeApproval: remove };
+}
+
+// ---------------------------------------------------------------------------
+// Risk level styling helpers
+// ---------------------------------------------------------------------------
+const RISK_COLORS: Record<string, { bg: string; text: string; border: string }> = {
+  critical: { bg: "bg-error/10", text: "text-error", border: "border-error/30" },
+  high: { bg: "bg-warning/10", text: "text-warning", border: "border-warning/30" },
+  medium: { bg: "bg-brand/10", text: "text-brand", border: "border-brand/30" },
+  low: { bg: "bg-success/10", text: "text-success", border: "border-success/30" },
+};
+
+function riskStyle(level?: string) {
+  return RISK_COLORS[(level || "low").toLowerCase()] ?? RISK_COLORS.low;
+}
+
+// ---------------------------------------------------------------------------
+// Approval card displayed inline in the chat area
+// ---------------------------------------------------------------------------
+function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onResolved: (id: string) => void }) {
+  const { t } = useTranslation();
+  const [resolving, setResolving] = useState<"approve" | "deny" | null>(null);
+
+  const handleResolve = async (approved: boolean) => {
+    setResolving(approved ? "approve" : "deny");
+    try {
+      await resolveApproval(approval.id, approved);
+      onResolved(approval.id);
+    } catch {
+      // Approval may have already been resolved or timed out
+      onResolved(approval.id);
+    } finally {
+      setResolving(null);
+    }
+  };
+
+  const rs = riskStyle(approval.risk_level);
+
+  return (
+    <div className={`mx-auto w-full max-w-lg rounded-2xl border ${rs.border} ${rs.bg} p-4 shadow-lg animate-fade-in-up`}>
+      {/* Header */}
+      <div className="flex items-center gap-2 mb-3">
+        <ShieldAlert className={`h-5 w-5 ${rs.text}`} />
+        <span className={`text-xs font-black uppercase tracking-widest ${rs.text}`}>
+          {t("chat.approval_required")}
+        </span>
+        {approval.risk_level && (
+          <span className={`ml-auto text-[10px] font-bold uppercase px-2 py-0.5 rounded-full ${rs.bg} ${rs.text} border ${rs.border}`}>
+            {approval.risk_level}
+          </span>
+        )}
+      </div>
+
+      {/* Tool info */}
+      <div className="space-y-1 mb-4">
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-bold uppercase text-text-dim tracking-wider">{t("chat.approval_tool")}</span>
+          <code className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-main">{approval.tool_name || "unknown"}</code>
+        </div>
+        {(approval.description || approval.action_summary || approval.action) && (
+          <p className="text-sm text-text-dim leading-relaxed">
+            {approval.description || approval.action_summary || approval.action}
+          </p>
+        )}
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex gap-3">
+        <button
+          onClick={() => handleResolve(true)}
+          disabled={resolving !== null}
+          className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-success text-white font-bold text-sm shadow-lg shadow-success/20 hover:shadow-success/40 hover:-translate-y-0.5 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {resolving === "approve" ? (
+            <RefreshCw className="h-4 w-4 animate-spin" />
+          ) : (
+            <CheckCircle className="h-4 w-4" />
+          )}
+          {t("approvals.approve")}
+        </button>
+        <button
+          onClick={() => handleResolve(false)}
+          disabled={resolving !== null}
+          className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-error text-white font-bold text-sm shadow-lg shadow-error/20 hover:shadow-error/40 hover:-translate-y-0.5 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {resolving === "deny" ? (
+            <RefreshCw className="h-4 w-4 animate-spin" />
+          ) : (
+            <XCircle className="h-4 w-4" />
+          )}
+          {t("approvals.reject")}
+        </button>
+      </div>
     </div>
   );
 }
@@ -532,6 +699,7 @@ export function ChatPage() {
     return a.name.localeCompare(b.name);
   });
   const { messages, isLoading, sendMessage, clearHistory, wsConnected } = useChatMessages(selectedAgentId || null, agents);
+  const { pendingApprovals, removeApproval } = useApprovalPoller(selectedAgentId || null);
   const selectedAgent = agents.find(a => a.id === selectedAgentId);
 
   useEffect(() => {
@@ -542,7 +710,7 @@ export function ChatPage() {
     }
   }, [agents, selectedAgentId]);
 
-  // 滚动到最新消息
+  // Scroll to latest message
   useEffect(() => {
     if (messages.length > 0) {
       setTimeout(() => {
@@ -552,31 +720,31 @@ export function ChatPage() {
   }, [messages]);
 
   return (
-    <div className="flex h-[calc(100vh-140px)] flex-col">
-      {/* 头部 */}
-      <header className="pb-4">
+    <div className="flex h-[calc(100vh-100px)] sm:h-[calc(100vh-140px)] flex-col">
+      {/* Header */}
+      <header className="pb-2 sm:pb-4">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="relative">
+          <div className="flex items-center gap-2 sm:gap-3">
+            <div className="relative hidden sm:block">
               <Sparkles className="h-5 w-5 text-brand" />
               <span className="absolute inset-0 bg-brand/30 animate-ping" />
             </div>
-            <span className="text-brand font-bold uppercase tracking-widest text-[10px]">{t("chat.neural_terminal")}</span>
+            <span className="text-brand font-bold uppercase tracking-widest text-[10px] hidden sm:inline">{t("chat.neural_terminal")}</span>
+            <h1 className="text-xl sm:text-3xl font-extrabold tracking-tight">{t("chat.title")}</h1>
           </div>
           <button
             onClick={() => queryClient.invalidateQueries({ queryKey: ["agents", "list"] })}
-            className="p-2.5 rounded-xl hover:bg-surface-hover text-text-dim hover:text-brand transition-all"
+            className="p-2 sm:p-2.5 rounded-xl hover:bg-surface-hover text-text-dim hover:text-brand transition-all"
           >
             <RefreshCw className={`h-4 w-4 ${agentsQuery.isFetching ? "animate-spin" : ""}`} />
           </button>
         </div>
-        <h1 className="mt-2 text-3xl font-extrabold tracking-tight">{t("chat.title")}</h1>
       </header>
 
-      {/* 主内容区 */}
+      {/* Main content area */}
       <div className="flex flex-1 overflow-hidden rounded-2xl border border-border-subtle bg-surface shadow-xl ring-1 ring-black/5 dark:ring-white/5">
-        {/* 左侧 Agent 列表 */}
-        <aside className="w-64 flex-shrink-0 border-r border-border-subtle bg-main/30 backdrop-blur-md flex flex-col">
+        {/* Left sidebar - Agent list */}
+        <aside className="hidden md:flex w-64 flex-shrink-0 border-r border-border-subtle bg-main/30 backdrop-blur-md flex-col">
           <div className="p-4 border-b border-border-subtle">
             <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60">{t("nav.agents")}</h3>
           </div>
@@ -619,12 +787,28 @@ export function ChatPage() {
           </div>
         </aside>
 
-        {/* 右侧聊天区域 */}
+        {/* Right side - Chat area */}
         <main className="flex-1 flex flex-col overflow-hidden bg-main/10 relative">
-          {/* 背景装饰 */}
+          {/* Background decoration */}
           <div className="absolute inset-0 pointer-events-none opacity-30">
             <div className="absolute top-0 left-0 w-64 h-64 bg-brand/5 rounded-full blur-3xl" />
             <div className="absolute bottom-0 right-0 w-48 h-48 bg-accent/5 rounded-full blur-3xl" />
+          </div>
+
+          {/* Mobile agent selector */}
+          <div className="md:hidden px-3 py-2 border-b border-border-subtle bg-surface/80">
+            <select
+              value={selectedAgentId}
+              onChange={(e) => setSelectedAgentId(e.target.value)}
+              className="w-full rounded-lg border border-border-subtle bg-main px-3 py-2 text-sm font-bold outline-none focus:border-brand"
+            >
+              <option value="">{t("chat.select_agent")}</option>
+              {agents.map(agent => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name} ({agent.state || "unknown"})
+                </option>
+              ))}
+            </select>
           </div>
 
           {selectedAgentId && (
@@ -637,8 +821,8 @@ export function ChatPage() {
             />
           )}
 
-          {/* 消息区域 */}
-          <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin">
+          {/* Message area */}
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4 sm:space-y-6 scrollbar-thin">
             {!selectedAgentId ? (
               <div className="h-full flex flex-col items-center justify-center text-center relative">
                 <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-main/50" />
@@ -662,13 +846,17 @@ export function ChatPage() {
             ) : (
               <div className="space-y-6">
                 {messages.map(msg => <MessageBubble key={msg.id} message={msg} />)}
+                {/* Inline approval cards for pending requests */}
+                {pendingApprovals.map(approval => (
+                  <ApprovalCard key={approval.id} approval={approval} onResolved={removeApproval} />
+                ))}
                 <div ref={messagesEndRef} />
               </div>
             )}
           </div>
 
-          {/* 输入区域 */}
-          <div className={`p-4 border-t border-border-subtle bg-surface/90 backdrop-blur-md transition-all ${!selectedAgentId ? "opacity-30 pointer-events-none" : ""}`}>
+          {/* Input area */}
+          <div className={`p-2 sm:p-4 border-t border-border-subtle bg-surface/90 backdrop-blur-md transition-all ${!selectedAgentId ? "opacity-30 pointer-events-none" : ""}`}>
             <ChatInput
               onSend={sendMessage}
               disabled={isLoading}

@@ -1306,12 +1306,34 @@ enum SystemCommands {
 }
 
 fn init_tracing_stderr(log_level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-        )
-        .init();
+    // When the telemetry feature is enabled, we use the layered registry
+    // so we can optionally attach an OpenTelemetry span exporter.
+    // When disabled, we use the simpler fmt-only subscriber.
+    #[cfg(feature = "telemetry")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+
+        let fmt_layer = tracing_subscriber::fmt::layer();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+    }
+
+    #[cfg(not(feature = "telemetry"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+            )
+            .init();
+    }
 }
 
 /// Get the LibreFang home directory, respecting LIBREFANG_HOME env var.
@@ -2285,13 +2307,13 @@ fn cmd_start(config: Option<PathBuf>, tail: bool, spawned: bool, foreground: boo
             }
         };
 
-        let listen_addr = kernel.config.api_listen.clone();
-        let daemon_info_path = kernel.config.home_dir.join("daemon.json");
-        let provider = kernel.config.default_model.provider.clone();
-        let model = kernel.config.default_model.model.clone();
-        let agent_count = kernel.registry.count();
+        let listen_addr = kernel.config_ref().api_listen.clone();
+        let daemon_info_path = kernel.config_ref().home_dir.join("daemon.json");
+        let provider = kernel.config_ref().default_model.provider.clone();
+        let model = kernel.config_ref().default_model.model.clone();
+        let agent_count = kernel.agent_registry().count();
         let model_count = kernel
-            .model_catalog
+            .model_catalog_ref()
             .read()
             .map(|c| c.list_models().len())
             .unwrap_or(0);
@@ -2724,7 +2746,7 @@ fn cmd_agent_list(config: Option<PathBuf>, json: bool) {
         }
     } else {
         let kernel = boot_kernel(config);
-        let agents = kernel.registry.list();
+        let agents = kernel.agent_registry().list();
 
         if json {
             let list: Vec<serde_json::Value> = agents
@@ -3031,7 +3053,7 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
         }
     } else {
         let kernel = boot_kernel(config);
-        let agent_count = kernel.registry.count();
+        let agent_count = kernel.agent_registry().count();
 
         if json {
             println!(
@@ -3039,9 +3061,9 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "in-process",
                     "agent_count": agent_count,
-                    "data_dir": kernel.config.data_dir.display().to_string(),
-                    "default_provider": kernel.config.default_model.provider,
-                    "default_model": kernel.config.default_model.model,
+                    "data_dir": kernel.config_ref().data_dir.display().to_string(),
+                    "default_provider": kernel.config_ref().default_model.provider,
+                    "default_model": kernel.config_ref().default_model.model,
                     "daemon": false,
                 }))
                 .unwrap_or_default()
@@ -3054,12 +3076,15 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
         ui::kv(&i18n::t("label-agents"), &agent_count.to_string());
         ui::kv(
             &i18n::t("label-provider"),
-            &kernel.config.default_model.provider,
+            &kernel.config_ref().default_model.provider,
         );
-        ui::kv(&i18n::t("label-model"), &kernel.config.default_model.model);
+        ui::kv(
+            &i18n::t("label-model"),
+            &kernel.config_ref().default_model.model,
+        );
         ui::kv(
             &i18n::t("label-data-dir"),
-            &kernel.config.data_dir.display().to_string(),
+            &kernel.config_ref().data_dir.display().to_string(),
         );
         ui::kv_warn(
             &i18n::t("label-daemon"),
@@ -3071,7 +3096,7 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
         if agent_count > 0 {
             ui::blank();
             ui::section(&i18n::t("section-persisted-agents"));
-            for entry in kernel.registry.list() {
+            for entry in kernel.agent_registry().list() {
                 println!("    {} ({}) -- {:?}", entry.name, entry.id, entry.state);
             }
         }

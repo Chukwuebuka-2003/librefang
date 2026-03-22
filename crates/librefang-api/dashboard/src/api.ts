@@ -194,6 +194,8 @@ export interface WorkflowStep {
   agent_name?: string;
   prompt: string;
   timeout_secs?: number;
+  inherit_context?: boolean;
+  depends_on?: string[];
 }
 
 export interface WorkflowItem {
@@ -470,12 +472,26 @@ export interface GoalItem {
 
 type Json = Record<string, unknown>;
 
+// Global 401 handler — set by App.tsx to trigger login screen
+let _onUnauthorized: (() => void) | null = null;
+let _unauthorizedFired = false;
+export function setOnUnauthorized(fn: (() => void) | null) {
+  _onUnauthorized = fn;
+  _unauthorizedFired = false;
+}
+
 function authHeader(): HeadersInit {
   const token = localStorage.getItem("librefang-api-key") || "";
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 async function parseError(response: Response): Promise<Error> {
+  // If 401, trigger global logout (only once to prevent infinite loop)
+  if (response.status === 401 && _onUnauthorized && !_unauthorizedFired) {
+    _unauthorizedFired = true;
+    clearApiKey();
+    _onUnauthorized();
+  }
   const text = await response.text();
   let message = response.statusText;
   try {
@@ -737,6 +753,64 @@ export async function clawhubInstall(slug: string, version?: string): Promise<Ap
   return post<ApiActionResponse>("/api/clawhub/install", { slug, version: version || "latest" });
 }
 
+// ── Skillhub API ─────────────────────────────────────
+
+export async function skillhubSearch(query: string): Promise<ClawHubBrowseResponse> {
+  return get<ClawHubBrowseResponse>(`/api/skillhub/search?q=${encodeURIComponent(query)}&limit=20`);
+}
+
+export async function skillhubBrowse(sort?: string): Promise<ClawHubBrowseResponse> {
+  const params = new URLSearchParams();
+  if (sort) params.set("sort", sort);
+  params.set("limit", "50");
+  return get<ClawHubBrowseResponse>(`/api/skillhub/browse?${params}`);
+}
+
+export async function skillhubInstall(slug: string): Promise<ApiActionResponse> {
+  return post<ApiActionResponse>("/api/skillhub/install", { slug });
+}
+
+export async function skillhubGetSkill(slug: string): Promise<ClawHubSkillDetail> {
+  return get<ClawHubSkillDetail>(`/api/skillhub/skill/${encodeURIComponent(slug)}`);
+}
+
+// ── Workflow Templates ────────────────────────────────
+
+export interface TemplateParameter {
+  name: string;
+  description?: string;
+  param_type?: string;
+  default?: unknown;
+  required?: boolean;
+}
+
+export interface WorkflowTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  tags?: string[];
+  parameters?: TemplateParameter[];
+  steps?: WorkflowStep[];
+}
+
+export async function listWorkflowTemplates(q?: string, category?: string): Promise<WorkflowTemplate[]> {
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (category) params.set("category", category);
+  const qs = params.toString();
+  const data = await get<{ templates?: WorkflowTemplate[] }>(`/api/workflow-templates${qs ? `?${qs}` : ""}`);
+  return data.templates ?? [];
+}
+
+export async function getWorkflowTemplate(id: string): Promise<WorkflowTemplate> {
+  return get<WorkflowTemplate>(`/api/workflow-templates/${encodeURIComponent(id)}`);
+}
+
+export async function instantiateTemplate(id: string, params: Record<string, unknown>): Promise<ApiActionResponse> {
+  return post<ApiActionResponse>(`/api/workflow-templates/${encodeURIComponent(id)}/instantiate`, params);
+}
+
 export async function listWorkflows(): Promise<WorkflowItem[]> {
   return get<WorkflowItem[]>("/api/workflows");
 }
@@ -874,6 +948,27 @@ export async function approveApproval(id: string): Promise<ApiActionResponse> {
 
 export async function rejectApproval(id: string): Promise<ApiActionResponse> {
   return post<ApiActionResponse>(`/api/approvals/${encodeURIComponent(id)}/reject`, {});
+}
+
+/**
+ * List only pending approval requests, optionally filtered by agent ID.
+ */
+export async function listPendingApprovals(agentId?: string): Promise<ApprovalItem[]> {
+  const all = await listApprovals();
+  return all.filter(
+    (a) => a.status === "pending" && (!agentId || a.agent_id === agentId),
+  );
+}
+
+/**
+ * Resolve a pending approval request (approve or deny).
+ */
+export async function resolveApproval(id: string, approved: boolean): Promise<void> {
+  if (approved) {
+    await approveApproval(id);
+  } else {
+    await rejectApproval(id);
+  }
 }
 
 export async function switchAgentSession(
@@ -1202,7 +1297,8 @@ export async function getA2ATaskStatus(taskId: string): Promise<A2ATaskStatus> {
 
 export async function checkAuthRequired(): Promise<boolean> {
   try {
-    const response = await fetch("/api/health", {
+    // Use /api/status (requires auth) instead of /api/health (public)
+    const response = await fetch("/api/status", {
       headers: { ...authHeader() },
     });
     return response.status === 401;
@@ -1220,7 +1316,38 @@ export function clearApiKey() {
 }
 
 export function hasApiKey(): boolean {
-  return !!localStorage.getItem("librefang-api-key");
+  const key = localStorage.getItem("librefang-api-key");
+  return !!key && key.length > 0;
+}
+
+export type AuthMode = "credentials" | "api_key" | "none";
+
+export async function checkDashboardAuthMode(): Promise<AuthMode> {
+  try {
+    const resp = await fetch("/api/auth/dashboard-check");
+    if (!resp.ok) return "none";
+    const data = await resp.json();
+    return (data.mode as AuthMode) || "none";
+  } catch {
+    return "none";
+  }
+}
+
+export async function dashboardLogin(username: string, password: string): Promise<{ ok: boolean; token?: string; error?: string }> {
+  try {
+    const resp = await fetch("/api/auth/dashboard-login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await resp.json();
+    if (data.ok && data.token) {
+      setApiKey(data.token);
+    }
+    return data;
+  } catch (e: any) {
+    return { ok: false, error: e.message || "Network error" };
+  }
 }
 
 // ── Plugins ──────────────────────────────────────────

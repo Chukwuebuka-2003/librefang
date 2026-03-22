@@ -12,7 +12,9 @@ use crate::router;
 use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
-use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
+use crate::workflow::{
+    StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId, WorkflowTemplateRegistry,
+};
 
 use librefang_memory::MemorySubstrate;
 use librefang_runtime::agent_loop::{
@@ -230,128 +232,143 @@ fn collect_rotation_key_specs(
 
 pub struct LibreFangKernel {
     /// Kernel configuration.
-    pub config: KernelConfig,
+    pub(crate) config: KernelConfig,
     /// Agent registry.
-    pub registry: AgentRegistry,
+    pub(crate) registry: AgentRegistry,
     /// Capability manager.
-    pub capabilities: CapabilityManager,
+    pub(crate) capabilities: CapabilityManager,
     /// Event bus.
-    pub event_bus: EventBus,
+    pub(crate) event_bus: EventBus,
     /// Agent scheduler.
-    pub scheduler: AgentScheduler,
+    pub(crate) scheduler: AgentScheduler,
     /// Memory substrate.
-    pub memory: Arc<MemorySubstrate>,
+    pub(crate) memory: Arc<MemorySubstrate>,
     /// Proactive memory store (mem0-style auto_retrieve/auto_memorize).
-    pub proactive_memory: OnceLock<Arc<librefang_memory::ProactiveMemoryStore>>,
+    pub(crate) proactive_memory: OnceLock<Arc<librefang_memory::ProactiveMemoryStore>>,
     /// Process supervisor.
-    pub supervisor: Supervisor,
+    pub(crate) supervisor: Supervisor,
     /// Workflow engine.
-    pub workflows: WorkflowEngine,
+    pub(crate) workflows: WorkflowEngine,
+    /// Workflow template registry.
+    pub(crate) template_registry: WorkflowTemplateRegistry,
     /// Event-driven trigger engine.
-    pub triggers: TriggerEngine,
+    pub(crate) triggers: TriggerEngine,
     /// Background agent executor.
-    pub background: BackgroundExecutor,
+    pub(crate) background: BackgroundExecutor,
     /// Merkle hash chain audit trail.
-    pub audit_log: Arc<AuditLog>,
+    pub(crate) audit_log: Arc<AuditLog>,
     /// Cost metering engine.
-    pub metering: Arc<MeteringEngine>,
+    pub(crate) metering: Arc<MeteringEngine>,
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
-    pub auth: AuthManager,
+    pub(crate) auth: AuthManager,
     /// Model catalog registry (RwLock for auth status refresh from API).
-    pub model_catalog: std::sync::RwLock<librefang_runtime::model_catalog::ModelCatalog>,
+    pub(crate) model_catalog: std::sync::RwLock<librefang_runtime::model_catalog::ModelCatalog>,
     /// Skill registry for plugin skills (RwLock for hot-reload on install/uninstall).
-    pub skill_registry: std::sync::RwLock<librefang_skills::registry::SkillRegistry>,
+    pub(crate) skill_registry: std::sync::RwLock<librefang_skills::registry::SkillRegistry>,
     /// Tracks running agent tasks for cancellation support.
-    pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    pub(crate) running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
     /// MCP server connections (lazily initialized at start_background_agents).
-    pub mcp_connections: tokio::sync::Mutex<Vec<librefang_runtime::mcp::McpConnection>>,
+    pub(crate) mcp_connections: tokio::sync::Mutex<Vec<librefang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
-    pub mcp_tools: std::sync::Mutex<Vec<ToolDefinition>>,
+    pub(crate) mcp_tools: std::sync::Mutex<Vec<ToolDefinition>>,
     /// A2A task store for tracking task lifecycle.
     pub a2a_task_store: librefang_runtime::a2a::A2aTaskStore,
     /// Discovered external A2A agent cards.
     pub a2a_external_agents: std::sync::Mutex<Vec<(String, librefang_runtime::a2a::AgentCard)>>,
     /// Web tools context (multi-provider search + SSRF-protected fetch + caching).
-    pub web_ctx: librefang_runtime::web_search::WebToolsContext,
+    pub(crate) web_ctx: librefang_runtime::web_search::WebToolsContext,
     /// Browser automation manager (Playwright bridge sessions).
-    pub browser_ctx: librefang_runtime::browser::BrowserManager,
+    pub(crate) browser_ctx: librefang_runtime::browser::BrowserManager,
     /// Media understanding engine (image description, audio transcription).
-    pub media_engine: librefang_runtime::media_understanding::MediaEngine,
+    pub(crate) media_engine: librefang_runtime::media_understanding::MediaEngine,
     /// Text-to-speech engine.
-    pub tts_engine: librefang_runtime::tts::TtsEngine,
+    pub(crate) tts_engine: librefang_runtime::tts::TtsEngine,
     /// Device pairing manager.
-    pub pairing: crate::pairing::PairingManager,
+    pub(crate) pairing: crate::pairing::PairingManager,
     /// Embedding driver for vector similarity search (None = text fallback).
-    pub embedding_driver:
+    pub(crate) embedding_driver:
         Option<Arc<dyn librefang_runtime::embedding::EmbeddingDriver + Send + Sync>>,
     /// Hand registry — curated autonomous capability packages.
-    pub hand_registry: librefang_hands::registry::HandRegistry,
+    pub(crate) hand_registry: librefang_hands::registry::HandRegistry,
     /// Extension/integration registry (bundled MCP templates + install state).
-    pub extension_registry: std::sync::RwLock<librefang_extensions::registry::IntegrationRegistry>,
+    pub(crate) extension_registry:
+        std::sync::RwLock<librefang_extensions::registry::IntegrationRegistry>,
     /// Integration health monitor.
-    pub extension_health: librefang_extensions::health::HealthMonitor,
+    pub(crate) extension_health: librefang_extensions::health::HealthMonitor,
     /// Effective MCP server list (manual config + extension-installed, merged at boot).
-    pub effective_mcp_servers:
+    pub(crate) effective_mcp_servers:
         std::sync::RwLock<Vec<librefang_types::config::McpServerConfigEntry>>,
     /// Delivery receipt tracker (bounded LRU, max 10K entries).
-    pub delivery_tracker: DeliveryTracker,
+    pub(crate) delivery_tracker: DeliveryTracker,
     /// Cron job scheduler.
-    pub cron_scheduler: crate::cron::CronScheduler,
+    pub(crate) cron_scheduler: crate::cron::CronScheduler,
     /// Execution approval manager.
-    pub approval_manager: crate::approval::ApprovalManager,
+    pub(crate) approval_manager: crate::approval::ApprovalManager,
     /// Agent bindings for multi-account routing (Mutex for runtime add/remove).
-    pub bindings: std::sync::Mutex<Vec<librefang_types::config::AgentBinding>>,
+    pub(crate) bindings: std::sync::Mutex<Vec<librefang_types::config::AgentBinding>>,
     /// Broadcast configuration.
-    pub broadcast: librefang_types::config::BroadcastConfig,
+    pub(crate) broadcast: librefang_types::config::BroadcastConfig,
     /// Auto-reply engine.
-    pub auto_reply_engine: crate::auto_reply::AutoReplyEngine,
+    pub(crate) auto_reply_engine: crate::auto_reply::AutoReplyEngine,
     /// Plugin lifecycle hook registry.
-    pub hooks: librefang_runtime::hooks::HookRegistry,
+    pub(crate) hooks: librefang_runtime::hooks::HookRegistry,
     /// Persistent process manager for interactive sessions (REPLs, servers).
-    pub process_manager: Arc<librefang_runtime::process_manager::ProcessManager>,
+    pub(crate) process_manager: Arc<librefang_runtime::process_manager::ProcessManager>,
     /// OFP peer registry — tracks connected peers (set once during OFP startup).
-    pub peer_registry: OnceLock<librefang_wire::PeerRegistry>,
+    pub(crate) peer_registry: OnceLock<librefang_wire::PeerRegistry>,
     /// OFP peer node — the local networking node (set once during OFP startup).
-    pub peer_node: OnceLock<Arc<librefang_wire::PeerNode>>,
+    pub(crate) peer_node: OnceLock<Arc<librefang_wire::PeerNode>>,
     /// Boot timestamp for uptime calculation.
-    pub booted_at: std::time::Instant,
+    pub(crate) booted_at: std::time::Instant,
     /// WhatsApp Web gateway child process PID (for shutdown cleanup).
-    pub whatsapp_gateway_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    pub(crate) whatsapp_gateway_pid: Arc<std::sync::Mutex<Option<u32>>>,
     /// Channel adapters registered at bridge startup (for proactive `channel_send` tool).
-    pub channel_adapters:
+    pub(crate) channel_adapters:
         dashmap::DashMap<String, Arc<dyn librefang_channels::types::ChannelAdapter>>,
     /// Hot-reloadable default model override (set via config hot-reload, read at agent spawn).
-    pub default_model_override:
+    pub(crate) default_model_override:
         std::sync::RwLock<Option<librefang_types::config::DefaultModelConfig>>,
     /// Hot-reloadable tool policy override (set via config hot-reload, read in available_tools).
-    pub tool_policy_override: std::sync::RwLock<Option<librefang_types::tool_policy::ToolPolicy>>,
+    pub(crate) tool_policy_override:
+        std::sync::RwLock<Option<librefang_types::tool_policy::ToolPolicy>>,
     /// Per-agent message locks — serializes LLM calls for the same agent to prevent
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Per-agent mid-turn message injection senders (#956).
+    /// When an agent loop is running, it holds the receiver; callers use the sender
+    /// to inject messages between tool calls.
+    pub(crate) injection_senders: dashmap::DashMap<AgentId, tokio::sync::mpsc::Sender<String>>,
+    /// Per-agent injection receivers, created alongside senders and consumed by the agent loop.
+    injection_receivers:
+        dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>>,
     /// Sticky assistant routing per conversation (assistant + sender/thread).
     /// Preserves follow-up context for brief messages after a route to a specialist/hand.
     assistant_routes: dashmap::DashMap<String, AssistantRouteTarget>,
     /// Per-agent decision traces from the most recent message exchange.
     /// Stored for retrieval via `/api/agents/{id}/traces`.
-    pub decision_traces: dashmap::DashMap<AgentId, Vec<librefang_types::tool::DecisionTrace>>,
+    pub(crate) decision_traces:
+        dashmap::DashMap<AgentId, Vec<librefang_types::tool::DecisionTrace>>,
     /// Command queue with lane-based concurrency control.
-    pub command_queue: librefang_runtime::command_lane::CommandQueue,
+    pub(crate) command_queue: librefang_runtime::command_lane::CommandQueue,
     /// Pluggable context engine for memory recall, assembly, and compaction.
-    pub context_engine: Option<Box<dyn librefang_runtime::context_engine::ContextEngine>>,
+    pub(crate) context_engine: Option<Box<dyn librefang_runtime::context_engine::ContextEngine>>,
     /// Runtime config passed to context-engine lifecycle hooks.
     context_engine_config: librefang_runtime::context_engine::ContextEngineConfig,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<LibreFangKernel>>,
     /// Whether we've already logged the "no provider" audit entry (prevents spam).
-    pub provider_unconfigured_logged: std::sync::atomic::AtomicBool,
+    pub(crate) provider_unconfigured_logged: std::sync::atomic::AtomicBool,
     /// Cache for workspace context, identity files, and skill metadata to avoid
     /// redundant filesystem I/O and registry scans on every message.
     prompt_metadata_cache: PromptMetadataCache,
+    /// Lazy-loading driver cache — avoids recreating HTTP clients for the same
+    /// provider/key/url combination on every agent message.
+    driver_cache: librefang_runtime::drivers::DriverCache,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -735,6 +752,349 @@ fn gethostname() -> Option<String> {
     #[cfg(not(any(unix, windows)))]
     {
         None
+    }
+}
+
+// ── Public Facade Getters ────────────────────────────────────────────
+// These provide a stable API surface for external crates (librefang-api,
+// librefang-desktop) to access kernel internals. When all external call
+// sites are migrated to use getters, the underlying pub fields can be
+// narrowed to pub(crate).
+impl LibreFangKernel {
+    /// Full kernel configuration (read-only after boot).
+    #[inline]
+    pub fn config_ref(&self) -> &KernelConfig {
+        &self.config
+    }
+
+    /// LibreFang home directory path (shorthand for `config.home_dir`).
+    #[inline]
+    pub fn home_dir(&self) -> &Path {
+        &self.config.home_dir
+    }
+
+    /// Default LLM model configuration.
+    #[inline]
+    pub fn default_model(&self) -> &librefang_types::config::DefaultModelConfig {
+        &self.config.default_model
+    }
+
+    /// Agent registry (list, get, update agents).
+    #[inline]
+    pub fn agent_registry(&self) -> &AgentRegistry {
+        &self.registry
+    }
+
+    /// Memory substrate (structured storage, vector search).
+    #[inline]
+    pub fn memory_substrate(&self) -> &Arc<MemorySubstrate> {
+        &self.memory
+    }
+
+    /// Proactive memory store (mem0-style auto-memorize/retrieve).
+    #[inline]
+    pub fn proactive_memory_store(&self) -> Option<&Arc<librefang_memory::ProactiveMemoryStore>> {
+        self.proactive_memory.get()
+    }
+
+    /// Merkle hash chain audit trail.
+    #[inline]
+    pub fn audit(&self) -> &Arc<AuditLog> {
+        &self.audit_log
+    }
+
+    /// Cost metering engine.
+    #[inline]
+    pub fn metering_ref(&self) -> &Arc<MeteringEngine> {
+        &self.metering
+    }
+
+    /// Agent scheduler.
+    #[inline]
+    pub fn scheduler_ref(&self) -> &AgentScheduler {
+        &self.scheduler
+    }
+
+    /// Model catalog (RwLock — auth status refresh from API).
+    #[inline]
+    pub fn model_catalog_ref(
+        &self,
+    ) -> &std::sync::RwLock<librefang_runtime::model_catalog::ModelCatalog> {
+        &self.model_catalog
+    }
+
+    /// Skill registry (RwLock — hot-reload on install/uninstall).
+    #[inline]
+    pub fn skill_registry_ref(
+        &self,
+    ) -> &std::sync::RwLock<librefang_skills::registry::SkillRegistry> {
+        &self.skill_registry
+    }
+
+    /// Hand registry (curated autonomous capability packages).
+    #[inline]
+    pub fn hands(&self) -> &librefang_hands::registry::HandRegistry {
+        &self.hand_registry
+    }
+
+    /// Extension/integration registry (RwLock — hot-reload).
+    #[inline]
+    pub fn extensions(
+        &self,
+    ) -> &std::sync::RwLock<librefang_extensions::registry::IntegrationRegistry> {
+        &self.extension_registry
+    }
+
+    /// Integration health monitor.
+    #[inline]
+    pub fn extension_monitor(&self) -> &librefang_extensions::health::HealthMonitor {
+        &self.extension_health
+    }
+
+    /// Cron job scheduler.
+    #[inline]
+    pub fn cron(&self) -> &crate::cron::CronScheduler {
+        &self.cron_scheduler
+    }
+
+    /// Execution approval manager.
+    #[inline]
+    pub fn approvals(&self) -> &crate::approval::ApprovalManager {
+        &self.approval_manager
+    }
+
+    /// Workflow engine.
+    #[inline]
+    pub fn workflow_engine(&self) -> &WorkflowEngine {
+        &self.workflows
+    }
+
+    /// Workflow template registry.
+    #[inline]
+    pub fn templates(&self) -> &WorkflowTemplateRegistry {
+        &self.template_registry
+    }
+
+    /// Event-driven trigger engine.
+    #[inline]
+    pub fn trigger_engine(&self) -> &TriggerEngine {
+        &self.triggers
+    }
+
+    /// Process supervisor.
+    #[inline]
+    pub fn supervisor_ref(&self) -> &Supervisor {
+        &self.supervisor
+    }
+
+    /// RBAC authentication manager.
+    #[inline]
+    pub fn auth_manager(&self) -> &AuthManager {
+        &self.auth
+    }
+
+    /// Device pairing manager.
+    #[inline]
+    pub fn pairing_ref(&self) -> &crate::pairing::PairingManager {
+        &self.pairing
+    }
+
+    /// Web tools context (search + fetch).
+    #[inline]
+    pub fn web_tools(&self) -> &librefang_runtime::web_search::WebToolsContext {
+        &self.web_ctx
+    }
+
+    /// Browser automation manager.
+    #[inline]
+    pub fn browser(&self) -> &librefang_runtime::browser::BrowserManager {
+        &self.browser_ctx
+    }
+
+    /// Media understanding engine.
+    #[inline]
+    pub fn media(&self) -> &librefang_runtime::media_understanding::MediaEngine {
+        &self.media_engine
+    }
+
+    /// Text-to-speech engine.
+    #[inline]
+    pub fn tts(&self) -> &librefang_runtime::tts::TtsEngine {
+        &self.tts_engine
+    }
+
+    /// MCP server connections (Mutex — lazily initialized).
+    #[inline]
+    pub fn mcp_connections_ref(
+        &self,
+    ) -> &tokio::sync::Mutex<Vec<librefang_runtime::mcp::McpConnection>> {
+        &self.mcp_connections
+    }
+
+    /// MCP tool definitions cache.
+    #[inline]
+    pub fn mcp_tools_ref(&self) -> &std::sync::Mutex<Vec<ToolDefinition>> {
+        &self.mcp_tools
+    }
+
+    /// Effective MCP server list (config + extensions merged).
+    #[inline]
+    pub fn effective_mcp_servers_ref(
+        &self,
+    ) -> &std::sync::RwLock<Vec<librefang_types::config::McpServerConfigEntry>> {
+        &self.effective_mcp_servers
+    }
+
+    /// A2A task store.
+    #[inline]
+    pub fn a2a_tasks(&self) -> &librefang_runtime::a2a::A2aTaskStore {
+        &self.a2a_task_store
+    }
+
+    /// Discovered external A2A agent cards.
+    #[inline]
+    pub fn a2a_agents(
+        &self,
+    ) -> &std::sync::Mutex<Vec<(String, librefang_runtime::a2a::AgentCard)>> {
+        &self.a2a_external_agents
+    }
+
+    /// Delivery receipt tracker.
+    #[inline]
+    pub fn delivery(&self) -> &DeliveryTracker {
+        &self.delivery_tracker
+    }
+
+    /// Running agent task handles (for cancellation).
+    #[inline]
+    pub fn running_tasks_ref(&self) -> &dashmap::DashMap<AgentId, tokio::task::AbortHandle> {
+        &self.running_tasks
+    }
+
+    /// Per-agent decision traces.
+    #[inline]
+    pub fn traces(&self) -> &dashmap::DashMap<AgentId, Vec<librefang_types::tool::DecisionTrace>> {
+        &self.decision_traces
+    }
+
+    /// Channel adapters map.
+    #[inline]
+    pub fn channel_adapters_ref(
+        &self,
+    ) -> &dashmap::DashMap<String, Arc<dyn librefang_channels::types::ChannelAdapter>> {
+        &self.channel_adapters
+    }
+
+    /// Agent bindings for multi-account routing.
+    #[inline]
+    pub fn bindings_ref(&self) -> &std::sync::Mutex<Vec<librefang_types::config::AgentBinding>> {
+        &self.bindings
+    }
+
+    /// Broadcast configuration.
+    #[inline]
+    pub fn broadcast_ref(&self) -> &librefang_types::config::BroadcastConfig {
+        &self.broadcast
+    }
+
+    /// Uptime since kernel boot.
+    #[inline]
+    pub fn uptime(&self) -> std::time::Duration {
+        self.booted_at.elapsed()
+    }
+
+    /// Embedding driver (None = text fallback).
+    #[inline]
+    pub fn embedding(
+        &self,
+    ) -> Option<&Arc<dyn librefang_runtime::embedding::EmbeddingDriver + Send + Sync>> {
+        self.embedding_driver.as_ref()
+    }
+
+    /// Command queue.
+    #[inline]
+    pub fn command_queue_ref(&self) -> &librefang_runtime::command_lane::CommandQueue {
+        &self.command_queue
+    }
+
+    /// Persistent process manager.
+    #[inline]
+    pub fn processes(&self) -> &Arc<librefang_runtime::process_manager::ProcessManager> {
+        &self.process_manager
+    }
+
+    /// OFP peer registry (set once at startup).
+    #[inline]
+    pub fn peer_registry_ref(&self) -> Option<&librefang_wire::PeerRegistry> {
+        self.peer_registry.get()
+    }
+
+    /// Hook registry.
+    #[inline]
+    pub fn hook_registry(&self) -> &librefang_runtime::hooks::HookRegistry {
+        &self.hooks
+    }
+
+    /// Auto-reply engine.
+    #[inline]
+    pub fn auto_reply(&self) -> &crate::auto_reply::AutoReplyEngine {
+        &self.auto_reply_engine
+    }
+
+    /// Default model override (hot-reloadable).
+    #[inline]
+    pub fn default_model_override_ref(
+        &self,
+    ) -> &std::sync::RwLock<Option<librefang_types::config::DefaultModelConfig>> {
+        &self.default_model_override
+    }
+
+    /// Tool policy override (hot-reloadable).
+    #[inline]
+    pub fn tool_policy_override_ref(
+        &self,
+    ) -> &std::sync::RwLock<Option<librefang_types::tool_policy::ToolPolicy>> {
+        &self.tool_policy_override
+    }
+
+    /// WhatsApp gateway PID.
+    #[inline]
+    pub fn whatsapp_pid(&self) -> &Arc<std::sync::Mutex<Option<u32>>> {
+        &self.whatsapp_gateway_pid
+    }
+
+    /// Per-agent message injection senders.
+    #[inline]
+    pub fn injection_senders_ref(
+        &self,
+    ) -> &dashmap::DashMap<AgentId, tokio::sync::mpsc::Sender<String>> {
+        &self.injection_senders
+    }
+
+    /// Context engine (pluggable memory recall + assembly).
+    #[inline]
+    pub fn context_engine_ref(
+        &self,
+    ) -> Option<&dyn librefang_runtime::context_engine::ContextEngine> {
+        self.context_engine.as_deref()
+    }
+
+    /// Event bus.
+    #[inline]
+    pub fn event_bus_ref(&self) -> &EventBus {
+        &self.event_bus
+    }
+
+    /// OFP peer node (set once at startup).
+    #[inline]
+    pub fn peer_node_ref(&self) -> Option<&Arc<librefang_wire::PeerNode>> {
+        self.peer_node.get()
+    }
+
+    /// Provider unconfigured log flag (atomic).
+    #[inline]
+    pub fn provider_unconfigured_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.provider_unconfigured_logged
     }
 }
 
@@ -1375,6 +1735,7 @@ impl LibreFangKernel {
             proactive_memory: OnceLock::new(),
             supervisor,
             workflows: WorkflowEngine::new(),
+            template_registry: WorkflowTemplateRegistry::new(),
             triggers: TriggerEngine::new(),
             background,
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
@@ -1415,6 +1776,8 @@ impl LibreFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             tool_policy_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            injection_senders: dashmap::DashMap::new(),
+            injection_receivers: dashmap::DashMap::new(),
             assistant_routes: dashmap::DashMap::new(),
             decision_traces: dashmap::DashMap::new(),
             command_queue,
@@ -1423,6 +1786,7 @@ impl LibreFangKernel {
             self_handle: OnceLock::new(),
             provider_unconfigured_logged: std::sync::atomic::AtomicBool::new(false),
             prompt_metadata_cache: PromptMetadataCache::new(),
+            driver_cache: librefang_runtime::drivers::DriverCache::new(),
         };
 
         // Initialize proactive memory system (mem0-style) from config.
@@ -1537,6 +1901,7 @@ impl LibreFangKernel {
 
                     // Re-register in the in-memory registry
                     let mut restored_entry = entry;
+                    restored_entry.last_active = chrono::Utc::now();
 
                     // Check enabled flag — also do a direct TOML read as fallback
                     let mut is_enabled = restored_entry.manifest.enabled;
@@ -1691,6 +2056,18 @@ system_prompt = "You are a helpful assistant."
                 info!(
                     "Auto-registered {loaded} workflow(s) from {}",
                     workflows_dir.display()
+                );
+            }
+        }
+
+        // Load workflow templates from ~/.librefang/workflows/templates/
+        {
+            let user_dir = kernel.config.home_dir.join("workflows").join("templates");
+            let loaded = kernel.template_registry.load_templates_from_dir(&user_dir);
+            if loaded > 0 {
+                info!(
+                    "Loaded {loaded} workflow template(s) from {}",
+                    user_dir.display()
                 );
             }
         }
@@ -2036,6 +2413,178 @@ system_prompt = "You are a helpful assistant."
             .await
     }
 
+    /// Send an ephemeral "side question" to an agent (`/btw` command).
+    ///
+    /// The message is answered using the agent's system prompt and model, but in a
+    /// **fresh temporary session** — no conversation history is loaded and the
+    /// exchange is **not persisted** to the real session. This lets users ask quick
+    /// throwaway questions without polluting the ongoing conversation context.
+    pub async fn send_message_ephemeral(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+    ) -> KernelResult<AgentLoopResult> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        if entry.state == AgentState::Suspended {
+            tracing::debug!(agent_id = %agent_id, "Skipping ephemeral message to suspended agent");
+            return Ok(AgentLoopResult::default());
+        }
+
+        // Ephemeral: no tools — prevents side effects (tool writes to memory/disk)
+        let tools: Vec<librefang_types::tool::ToolDefinition> = vec![];
+        let mut manifest = entry.manifest.clone();
+
+        // Reuse the prompt-builder to get a proper system prompt
+        {
+            let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
+            let shared_id = shared_memory_agent_id();
+            let user_name = self
+                .memory
+                .structured_get(shared_id, "user_name")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_str().map(String::from));
+
+            let peer_agents: Vec<(String, String, String)> = self
+                .registry
+                .list()
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        format!("{:?}", a.state),
+                        a.manifest.model.model.clone(),
+                    )
+                })
+                .collect();
+
+            let ws_meta = manifest
+                .workspace
+                .as_ref()
+                .map(|w| self.cached_workspace_metadata(w, manifest.autonomous.is_some()));
+
+            let prompt_ctx = librefang_runtime::prompt_builder::PromptContext {
+                agent_name: manifest.name.clone(),
+                agent_description: manifest.description.clone(),
+                base_system_prompt: manifest.model.system_prompt.clone(),
+                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
+                recalled_memories: vec![],
+                skill_summary: String::new(),
+                skill_prompt_context: String::new(),
+                mcp_summary: if mcp_tool_count > 0 {
+                    self.build_mcp_summary(&manifest.mcp_servers)
+                } else {
+                    String::new()
+                },
+                workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
+                soul_md: ws_meta.as_ref().and_then(|m| m.soul_md.clone()),
+                user_md: ws_meta.as_ref().and_then(|m| m.user_md.clone()),
+                memory_md: ws_meta.as_ref().and_then(|m| m.memory_md.clone()),
+                canonical_context: None,
+                user_name,
+                channel_type: None,
+                sender_display_name: None,
+                sender_user_id: None,
+                is_subagent: false,
+                is_autonomous: manifest.autonomous.is_some(),
+                agents_md: ws_meta.as_ref().and_then(|m| m.agents_md.clone()),
+                bootstrap_md: ws_meta.as_ref().and_then(|m| m.bootstrap_md.clone()),
+                workspace_context: ws_meta.as_ref().and_then(|m| m.workspace_context.clone()),
+                identity_md: ws_meta.as_ref().and_then(|m| m.identity_md.clone()),
+                heartbeat_md: ws_meta.as_ref().and_then(|m| m.heartbeat_md.clone()),
+                peer_agents,
+                current_date: Some(
+                    chrono::Local::now()
+                        .format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)")
+                        .to_string(),
+                ),
+            };
+            manifest.model.system_prompt =
+                librefang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
+        }
+
+        let driver = self.resolve_driver(&manifest)?;
+
+        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
+            cat.find_model(&manifest.model.model)
+                .map(|m| m.context_window as usize)
+        });
+
+        // Create a temporary in-memory session (empty — no history loaded)
+        let ephemeral_session_id = SessionId::new();
+        let mut ephemeral_session = librefang_memory::session::Session {
+            id: ephemeral_session_id,
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: Some("ephemeral /btw".to_string()),
+        };
+
+        info!(
+            agent = %entry.name,
+            agent_id = %agent_id,
+            "Ephemeral /btw message — using temporary session (no history, no persistence)"
+        );
+
+        let result = run_agent_loop(
+            &manifest,
+            message,
+            &mut ephemeral_session,
+            &self.memory,
+            driver,
+            &tools,
+            None, // no kernel handle — keep side questions simple
+            None, // no skills
+            None, // no MCP
+            None, // no web
+            None, // no browser
+            None, // no embeddings
+            manifest.workspace.as_deref(),
+            None, // no phase callback
+            None, // no media
+            None, // no TTS
+            None, // no docker
+            None, // no hooks
+            ctx_window,
+            None, // no process manager
+            None, // no content blocks
+            None, // no proactive memory
+            None, // no context engine
+            None, // no pending messages
+        )
+        .await
+        .map_err(KernelError::LibreFang)?;
+
+        // NOTE: We intentionally do NOT save the ephemeral session, do NOT
+        // update canonical memory, do NOT write JSONL mirror, and do NOT
+        // append to the daily memory log. The side question is truly ephemeral.
+
+        // Still record metering so cost tracking stays accurate
+        let model = &manifest.model.model;
+        let cost = MeteringEngine::estimate_cost_with_catalog(
+            &self.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
+            model,
+            result.total_usage.input_tokens,
+            result.total_usage.output_tokens,
+        );
+        let _ = self.metering.record(&librefang_memory::usage::UsageRecord {
+            agent_id,
+            model: model.clone(),
+            input_tokens: result.total_usage.input_tokens,
+            output_tokens: result.total_usage.output_tokens,
+            cost_usd: cost,
+            tool_calls: result.iterations.saturating_sub(1),
+        });
+
+        let mut result = result;
+        result.cost_usd = if cost > 0.0 { Some(cost) } else { None };
+
+        Ok(result)
+    }
+
     /// Internal: send a message with all optional parameters (content blocks + sender context).
     ///
     /// This is the unified entry point for all message dispatch. When `sender_context`
@@ -2337,6 +2886,11 @@ system_prompt = "You are a helpful assistant."
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
 
+        // Backfill thinking config from global config if per-agent is not set
+        if manifest.thinking.is_none() {
+            manifest.thinking = self.config.thinking.clone();
+        }
+
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
             let workspace_dir = resolve_workspace_dir(
@@ -2471,6 +3025,13 @@ system_prompt = "You are a helpful assistant."
                 "prompt_caching".to_string(),
                 serde_json::Value::Bool(self.config.prompt_caching),
             );
+
+            // Pass privacy config to the agent loop via metadata.
+            if let Ok(privacy_json) = serde_json::to_value(&self.config.privacy) {
+                manifest
+                    .metadata
+                    .insert("privacy".to_string(), privacy_json);
+            }
         }
 
         let memory = Arc::clone(&self.memory);
@@ -2540,6 +3101,9 @@ system_prompt = "You are a helpful assistant."
                     let _ = phase_tx.try_send(event);
                 });
 
+            // Set up mid-turn injection channel (#956)
+            let injection_rx = kernel_clone.setup_injection_channel(agent_id);
+
             let result = run_agent_loop_streaming(
                 &manifest,
                 &message_owned,
@@ -2573,8 +3137,12 @@ system_prompt = "You are a helpful assistant."
                 None, // content_blocks (streaming path uses text only for now)
                 kernel_clone.proactive_memory.get().cloned(),
                 kernel_clone.context_engine_for_agent(&manifest),
+                Some(&injection_rx),
             )
             .await;
+
+            // Tear down injection channel after loop finishes
+            kernel_clone.teardown_injection_channel(agent_id);
 
             match result {
                 Ok(result) => {
@@ -3187,6 +3755,11 @@ system_prompt = "You are a helpful assistant."
         // Apply model routing if configured (disabled in Stable mode)
         let mut manifest = entry.manifest.clone();
 
+        // Backfill thinking config from global config if per-agent is not set
+        if manifest.thinking.is_none() {
+            manifest.thinking = self.config.thinking.clone();
+        }
+
         // Lazy backfill: create workspace for existing agents spawned before workspaces
         if manifest.workspace.is_none() {
             let workspace_dir = resolve_workspace_dir(
@@ -3322,6 +3895,13 @@ system_prompt = "You are a helpful assistant."
                 "prompt_caching".to_string(),
                 serde_json::Value::Bool(self.config.prompt_caching),
             );
+
+            // Pass privacy config to the agent loop via metadata.
+            if let Ok(privacy_json) = serde_json::to_value(&self.config.privacy) {
+                manifest
+                    .metadata
+                    .insert("privacy".to_string(), privacy_json);
+            }
         }
 
         let is_stable = self.config.mode == librefang_types::config::KernelMode::Stable;
@@ -3406,6 +3986,9 @@ system_prompt = "You are a helpful assistant."
 
         let proactive_memory = self.proactive_memory.get().cloned();
 
+        // Set up mid-turn injection channel (#956)
+        let injection_rx = self.setup_injection_channel(agent_id);
+
         let result = run_agent_loop(
             &manifest,
             &message_with_links,
@@ -3438,9 +4021,14 @@ system_prompt = "You are a helpful assistant."
             content_blocks,
             proactive_memory,
             self.context_engine_for_agent(&manifest),
+            Some(&injection_rx),
         )
-        .await
-        .map_err(KernelError::LibreFang)?;
+        .await;
+
+        // Tear down injection channel after loop finishes
+        self.teardown_injection_channel(agent_id);
+
+        let result = result.map_err(KernelError::LibreFang)?;
 
         // Append new messages to canonical session for cross-channel memory
         if session.messages.len() > messages_before {
@@ -3496,6 +4084,60 @@ system_prompt = "You are a helpful assistant."
         }
 
         Ok(result)
+    }
+
+    /// Inject a message into a running agent's tool-execution loop (#956).
+    ///
+    /// If the agent is currently executing tools (mid-turn), the message will be
+    /// picked up between tool calls and interrupt the remaining sequence.
+    /// Returns `Ok(true)` if the message was sent, `Ok(false)` if no active
+    /// loop is running for this agent, or `Err` if the agent doesn't exist.
+    pub async fn inject_message(&self, agent_id: AgentId, message: &str) -> KernelResult<bool> {
+        // Verify the agent exists
+        if self.registry.get(agent_id).is_none() {
+            return Err(KernelError::LibreFang(LibreFangError::AgentNotFound(
+                agent_id.to_string(),
+            )));
+        }
+        if let Some(tx) = self.injection_senders.get(&agent_id) {
+            match tx.try_send(message.to_string()) {
+                Ok(()) => {
+                    info!(agent_id = %agent_id, "Mid-turn message injected");
+                    Ok(true)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!(agent_id = %agent_id, "Injection channel full — message dropped");
+                    Ok(false)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Receiver dropped — loop is no longer running
+                    self.injection_senders.remove(&agent_id);
+                    Ok(false)
+                }
+            }
+        } else {
+            // No active loop for this agent
+            Ok(false)
+        }
+    }
+
+    /// Set up the injection channel for an agent before running its loop.
+    /// Returns the receiver wrapped in a Mutex for the agent loop to consume.
+    fn setup_injection_channel(
+        &self,
+        agent_id: AgentId,
+    ) -> Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        self.injection_senders.insert(agent_id, tx);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        self.injection_receivers.insert(agent_id, Arc::clone(&rx));
+        rx
+    }
+
+    /// Tear down the injection channel after the agent loop finishes.
+    fn teardown_injection_channel(&self, agent_id: AgentId) {
+        self.injection_senders.remove(&agent_id);
+        self.injection_receivers.remove(&agent_id);
     }
 
     /// Resolve a module path relative to the kernel's home directory.
@@ -3696,6 +4338,102 @@ system_prompt = "You are a helpful assistant."
 
         info!(agent_id = %agent_id, session_id = %session_id.0, "Switched session");
         Ok(())
+    }
+
+    /// Export a session to a portable JSON-serializable struct for hibernation.
+    pub fn export_session(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> KernelResult<librefang_memory::session::SessionExport> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        let session = self
+            .memory
+            .get_session(session_id)
+            .map_err(KernelError::LibreFang)?
+            .ok_or_else(|| {
+                KernelError::LibreFang(LibreFangError::Internal("Session not found".to_string()))
+            })?;
+
+        if session.agent_id != agent_id {
+            return Err(KernelError::LibreFang(LibreFangError::Internal(
+                "Session belongs to a different agent".to_string(),
+            )));
+        }
+
+        let export = librefang_memory::session::SessionExport {
+            version: 1,
+            agent_name: entry.name.clone(),
+            agent_id: agent_id.0.to_string(),
+            session_id: session_id.0.to_string(),
+            messages: session.messages.clone(),
+            context_window_tokens: session.context_window_tokens,
+            label: session.label.clone(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            metadata: std::collections::HashMap::new(),
+        };
+
+        info!(agent_id = %agent_id, session_id = %session_id.0, "Exported session");
+        Ok(export)
+    }
+
+    /// Import a previously exported session, creating a new session under the given agent.
+    pub fn import_session(
+        &self,
+        agent_id: AgentId,
+        export: librefang_memory::session::SessionExport,
+    ) -> KernelResult<SessionId> {
+        // Verify agent exists
+        let _entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        // Validate version
+        if export.version != 1 {
+            return Err(KernelError::LibreFang(LibreFangError::Internal(format!(
+                "Unsupported session export version: {}",
+                export.version
+            ))));
+        }
+
+        // Validate agent_id matches (prevent importing another agent's session)
+        if !export.agent_id.is_empty() && export.agent_id != agent_id.to_string() {
+            return Err(KernelError::LibreFang(LibreFangError::Internal(format!(
+                "Session was exported from agent '{}', cannot import into '{}'",
+                export.agent_id, agent_id
+            ))));
+        }
+
+        // Validate messages are not empty
+        if export.messages.is_empty() {
+            return Err(KernelError::LibreFang(LibreFangError::Internal(
+                "Cannot import session with no messages".to_string(),
+            )));
+        }
+
+        // Create a new session with imported data
+        let new_session = librefang_memory::session::Session {
+            id: SessionId::new(),
+            agent_id,
+            messages: export.messages,
+            context_window_tokens: export.context_window_tokens,
+            label: export.label,
+        };
+
+        self.memory
+            .save_session(&new_session)
+            .map_err(KernelError::LibreFang)?;
+
+        info!(
+            agent_id = %agent_id,
+            new_session_id = %new_session.id.0,
+            imported_messages = new_session.messages.len(),
+            "Imported session from export"
+        );
+        Ok(new_session.id)
     }
 
     /// Inject the configured `session.reset_prompt` into a newly created session
@@ -4674,6 +5412,8 @@ system_prompt = "You are a helpful assistant."
                 }
                 HotAction::ReloadProviderUrls => {
                     info!("Hot-reload: applying provider URL overrides");
+                    // Invalidate cached drivers — URLs/keys may have changed.
+                    self.driver_cache.clear();
                     let mut catalog = self
                         .model_catalog
                         .write()
@@ -4708,6 +5448,8 @@ system_prompt = "You are a helpful assistant."
                         "Hot-reload: updating default model to {}/{}",
                         new_config.default_model.provider, new_config.default_model.model
                     );
+                    // Invalidate cached drivers — the default provider may have changed.
+                    self.driver_cache.clear();
                     let mut guard = self
                         .default_model_override
                         .write()
@@ -4758,7 +5500,31 @@ system_prompt = "You are a helpful assistant."
     ///
     /// Any matching triggers will dispatch messages to the subscribing agents.
     /// Returns the list of (agent_id, message) pairs that were triggered.
+    /// Includes depth limiting to prevent circular trigger chains (max 5 levels).
     pub async fn publish_event(&self, event: Event) -> Vec<(AgentId, String)> {
+        // Depth guard: prevent circular trigger chains
+        static TRIGGER_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        const MAX_TRIGGER_DEPTH: u32 = 5;
+
+        let depth = TRIGGER_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if depth >= MAX_TRIGGER_DEPTH {
+            TRIGGER_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                depth,
+                "Trigger depth limit reached, skipping evaluation to prevent circular chain"
+            );
+            return vec![];
+        }
+
+        // Decrement depth on all exit paths using a drop guard
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                TRIGGER_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _guard = DepthGuard;
+
         // Evaluate triggers before publishing (so describe_event works on the event)
         let triggered = self.triggers.evaluate(&event);
 
@@ -4791,15 +5557,42 @@ system_prompt = "You are a helpful assistant."
         prompt_template: String,
         max_fires: u64,
     ) -> KernelResult<TriggerId> {
-        // Verify agent exists
+        self.register_trigger_with_target(agent_id, pattern, prompt_template, max_fires, None)
+    }
+
+    /// Register a trigger with an optional cross-session target agent.
+    ///
+    /// When `target_agent` is `Some`, the triggered message is routed to that
+    /// agent instead of the owner. Both owner and target must exist.
+    pub fn register_trigger_with_target(
+        &self,
+        agent_id: AgentId,
+        pattern: TriggerPattern,
+        prompt_template: String,
+        max_fires: u64,
+        target_agent: Option<AgentId>,
+    ) -> KernelResult<TriggerId> {
+        // Verify owner agent exists
         if self.registry.get(agent_id).is_none() {
             return Err(KernelError::LibreFang(LibreFangError::AgentNotFound(
                 agent_id.to_string(),
             )));
         }
-        Ok(self
-            .triggers
-            .register(agent_id, pattern, prompt_template, max_fires))
+        // Verify target agent exists (if specified)
+        if let Some(target) = target_agent {
+            if self.registry.get(target).is_none() {
+                return Err(KernelError::LibreFang(LibreFangError::AgentNotFound(
+                    target.to_string(),
+                )));
+            }
+        }
+        Ok(self.triggers.register_with_target(
+            agent_id,
+            pattern,
+            prompt_template,
+            max_fires,
+            target_agent,
+        ))
     }
 
     /// Remove a trigger by ID.
@@ -4839,17 +5632,20 @@ system_prompt = "You are a helpful assistant."
                 KernelError::LibreFang(LibreFangError::Internal("Workflow not found".to_string()))
             })?;
 
-        // Agent resolver: looks up by name or ID in the registry
-        let resolver = |agent_ref: &StepAgent| -> Option<(AgentId, String)> {
+        // Agent resolver: looks up by name or ID in the registry.
+        // Returns (AgentId, agent_name, inherit_parent_context).
+        let resolver = |agent_ref: &StepAgent| -> Option<(AgentId, String, bool)> {
             match agent_ref {
                 StepAgent::ById { id } => {
                     let agent_id: AgentId = id.parse().ok()?;
                     let entry = self.registry.get(agent_id)?;
-                    Some((agent_id, entry.name.clone()))
+                    let inherit = entry.manifest.inherit_parent_context;
+                    Some((agent_id, entry.name.clone(), inherit))
                 }
                 StepAgent::ByName { name } => {
                     let entry = self.registry.find_by_name(name)?;
-                    Some((entry.id, entry.name.clone()))
+                    let inherit = entry.manifest.inherit_parent_context;
+                    Some((entry.id, entry.name.clone(), inherit))
                 }
             }
         };
@@ -5295,6 +6091,38 @@ system_prompt = "You are a helpful assistant."
             }
         }
 
+        // Periodic memory decay (deletes stale SESSION/AGENT memories by TTL)
+        {
+            let decay_config = self.config.memory.decay.clone();
+            if decay_config.enabled && decay_config.decay_interval_hours > 0 {
+                let kernel = Arc::clone(self);
+                let interval_hours = decay_config.decay_interval_hours;
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        u64::from(interval_hours) * 3600,
+                    ));
+                    interval.tick().await; // Skip first immediate tick
+                    loop {
+                        interval.tick().await;
+                        if kernel.supervisor.is_shutting_down() {
+                            break;
+                        }
+                        match kernel.memory.run_decay(&decay_config) {
+                            Ok(n) => {
+                                if n > 0 {
+                                    info!(deleted = n, "Memory decay sweep completed");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Memory decay sweep failed: {e}");
+                            }
+                        }
+                    }
+                });
+                info!("Memory decay scheduled every {interval_hours} hour(s)");
+            }
+        }
+
         // Connect to configured + extension MCP servers
         let has_mcp = self
             .effective_mcp_servers
@@ -5618,7 +6446,7 @@ system_prompt = "You are a helpful assistant."
         use crate::heartbeat::{check_agents, is_quiet_hours, HeartbeatConfig};
 
         let kernel = Arc::clone(self);
-        let config = HeartbeatConfig::default();
+        let config = HeartbeatConfig::from_toml(&kernel.config.heartbeat);
         let interval_secs = config.check_interval_secs;
 
         tokio::spawn(async move {
@@ -5859,7 +6687,7 @@ system_prompt = "You are a helpful assistant."
                 skip_permissions: true,
             };
 
-            match drivers::create_driver(&driver_config) {
+            match self.driver_cache.get_or_create(&driver_config) {
                 Ok(d) => d,
                 Err(e) => {
                     // If fresh driver creation fails (e.g. key not yet set for this
@@ -5936,7 +6764,7 @@ system_prompt = "You are a helpful assistant."
                     azure_openai: self.config.azure_openai.clone(),
                     skip_permissions: true,
                 };
-                match drivers::create_driver(&config) {
+                match self.driver_cache.get_or_create(&config) {
                     Ok(d) => chain.push((d, fb.model.clone())),
                     Err(e) => {
                         warn!("Fallback driver '{}' failed to init: {e}", fb_provider);
@@ -7156,6 +7984,12 @@ impl KernelHandle for LibreFangKernel {
             .collect()
     }
 
+    fn touch_heartbeat(&self, agent_id: &str) {
+        if let Ok(id) = agent_id.parse::<AgentId>() {
+            self.registry.touch(id);
+        }
+    }
+
     fn kill_agent(&self, agent_id: &str) -> Result<(), String> {
         let id: AgentId = agent_id
             .parse()
@@ -7521,16 +8355,37 @@ impl KernelHandle for LibreFangKernel {
         }
 
         let policy = self.approval_manager.policy();
+        let risk_level = crate::approval::ApprovalManager::classify_risk(tool_name);
+        let description = format!("Agent {} requests to execute {}", agent_id, tool_name);
         let req = TypedRequest {
             id: uuid::Uuid::new_v4(),
             agent_id: agent_id.to_string(),
             tool_name: tool_name.to_string(),
-            description: format!("Agent {} requests to execute {}", agent_id, tool_name),
+            description: description.clone(),
             action_summary: action_summary.chars().take(512).collect(),
-            risk_level: crate::approval::ApprovalManager::classify_risk(tool_name),
+            risk_level,
             requested_at: chrono::Utc::now(),
             timeout_secs: policy.timeout_secs,
         };
+
+        // Publish an ApprovalRequested event so channel adapters can notify users
+        {
+            use librefang_types::event::{
+                ApprovalRequestedEvent, Event, EventPayload, EventTarget,
+            };
+            let event = Event::new(
+                agent_id.parse().unwrap_or_default(),
+                EventTarget::System,
+                EventPayload::ApprovalRequested(ApprovalRequestedEvent {
+                    request_id: req.id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    description: description.clone(),
+                    risk_level: format!("{:?}", risk_level),
+                }),
+            );
+            self.event_bus.publish(event).await;
+        }
 
         let decision = self.approval_manager.request_approval(req).await;
         Ok(decision == ApprovalDecision::Approved)
@@ -8348,6 +9203,75 @@ mod tests {
         assert!(
             agents.iter().any(|entry| entry.name == "assistant"),
             "fresh kernel boot should auto-spawn an assistant agent"
+        );
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_send_message_ephemeral_unknown_agent_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(home_dir.join("data")).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+        // Use a random AgentId that doesn't exist
+        let bogus_id = AgentId::new();
+        let result = kernel.send_message_ephemeral(bogus_id, "hello?").await;
+        assert!(
+            result.is_err(),
+            "ephemeral message to unknown agent should error"
+        );
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_send_message_ephemeral_does_not_modify_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(home_dir.join("data")).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+        // Find the auto-spawned assistant agent
+        let agents = kernel.registry.list();
+        let assistant = agents
+            .iter()
+            .find(|a| a.name == "assistant")
+            .expect("assistant should exist");
+        let agent_id = assistant.id;
+        let session_id = assistant.session_id;
+
+        // Get session messages before ephemeral call
+        let session_before = kernel.memory.get_session(session_id).unwrap();
+        let msg_count_before = session_before.map(|s| s.messages.len()).unwrap_or(0);
+
+        // Send ephemeral message (will fail because no LLM provider, but that's OK —
+        // the point is the session should remain untouched)
+        let _ = kernel
+            .send_message_ephemeral(agent_id, "what is 2+2?")
+            .await;
+
+        // Check session is unchanged
+        let session_after = kernel.memory.get_session(session_id).unwrap();
+        let msg_count_after = session_after.map(|s| s.messages.len()).unwrap_or(0);
+        assert_eq!(
+            msg_count_before, msg_count_after,
+            "ephemeral /btw message should not modify the real session"
         );
 
         kernel.shutdown();

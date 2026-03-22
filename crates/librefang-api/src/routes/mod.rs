@@ -1,22 +1,41 @@
 //! Route handlers for the LibreFang API.
 //!
-//! This module is split into domain-specific sub-modules for maintainability.
-//! All public handler functions are re-exported here for backward compatibility.
+//! Each domain sub-module exports a `router()` function that builds its own route tree.
+//! `server.rs` combines all sub-routers via `.merge()`, avoiding hundreds of route
+//! registrations in a single function.
+//!
+//! Handler functions are still exposed via glob re-export to maintain
+//! `routes::handler_name` backward compatibility (in particular, the utoipa macros
+//! in openapi.rs require this path format).
 
-mod agents;
-mod budget;
-mod channels;
-mod config;
+// All modules export a `router()` function; glob re-export causes a name ambiguity
+// warning, but `router()` is only accessed via qualified paths (e.g.
+// `routes::agents::router()`), so there is no actual conflict.
+#![allow(ambiguous_glob_reexports)]
+
+pub mod agents;
+pub mod budget;
+pub mod channels;
+pub mod config;
 pub mod goals;
-mod memory;
-mod network;
-mod plugins;
-mod providers;
-mod skills;
-mod system;
-mod workflows;
+pub mod memory;
+pub mod network;
+pub mod plugins;
+pub mod providers;
+pub mod skills;
+pub mod system;
+pub mod workflows;
 
-// Re-export everything so `routes::handler_name` still works in server.rs.
+// Glob re-export to keep `routes::handler_name` backward compatible
+// (utoipa macros in openapi.rs, ws.rs, etc. all depend on this path format).
+//
+// Previously both system.rs and workflows.rs exported `list_templates` / `get_template`,
+// causing E0659 name ambiguity. The workflows.rs versions have been renamed to
+// `list_workflow_templates` / `get_workflow_template` to resolve the conflict.
+//
+// All modules export a `router()` function; glob re-export produces an ambiguity
+// warning, but `router()` is only accessed via qualified paths (e.g.
+// `routes::agents::router()`), so there is no actual conflict.
 pub use agents::*;
 pub use budget::*;
 pub use channels::*;
@@ -74,10 +93,16 @@ pub struct AppState {
     /// ClawHub response cache — prevents 429 rate limiting on rapid dashboard refreshes.
     /// Maps cache key → (fetched_at, response_json) with 120s TTL.
     pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
+    /// Skillhub response cache — prevents rate limiting on rapid dashboard refreshes.
+    /// Maps cache key → (fetched_at, response_json) with TTL.
+    pub skillhub_cache: DashMap<String, (Instant, serde_json::Value)>,
     /// Probe cache for local provider health checks (ollama/vllm/lmstudio).
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: librefang_runtime::provider_health::ProbeCache,
     /// Webhook subscription store for outbound event notifications.
     pub webhook_store: crate::webhook_store::WebhookStore,
+    /// Prometheus metrics handle (only set when `telemetry` feature + config enabled).
+    #[cfg(feature = "telemetry")]
+    pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }

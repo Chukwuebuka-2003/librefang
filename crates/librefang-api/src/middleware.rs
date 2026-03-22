@@ -160,10 +160,13 @@ pub async fn api_version_headers(request: Request<Body>, next: Next) -> Response
 /// If the key is empty or whitespace-only, auth is disabled entirely
 /// (public/local development mode).
 pub async fn auth(
-    axum::extract::State(api_key): axum::extract::State<String>,
+    axum::extract::State(api_key_lock): axum::extract::State<
+        std::sync::Arc<tokio::sync::RwLock<String>>,
+    >,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let api_key = api_key_lock.read().await.clone();
     // SECURITY: Capture method early for method-aware public endpoint checks.
     let method = request.method().clone();
 
@@ -242,7 +245,9 @@ pub async fn auth(
         // (they are the authentication entry points themselves).
         || (path == "/api/auth/providers" && is_get)
         || (path.starts_with("/api/auth/login") && is_get)
-        || path == "/api/auth/callback";
+        || path == "/api/auth/callback"
+        || path == "/api/auth/dashboard-login"
+        || path == "/api/auth/dashboard-check";
 
     if is_public {
         return next.run(request).await;
@@ -270,14 +275,19 @@ pub async fn auth(
             .and_then(|v| v.to_str().ok())
     });
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let header_auth = api_token.map(|token| {
+    // Split composite key (supports multiple valid tokens separated by \n).
+    let valid_keys: Vec<&str> = api_key.split('\n').filter(|k| !k.is_empty()).collect();
+
+    // Helper: constant-time check against any valid key
+    let matches_any = |token: &str| -> bool {
         use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
+        valid_keys
+            .iter()
+            .any(|key| key.len() == token.len() && token.as_bytes().ct_eq(key.as_bytes()).into())
+    };
+
+    // SECURITY: Use constant-time comparison to prevent timing attacks.
+    let header_auth = api_token.map(&matches_any);
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
     // cannot set custom headers, same approach as WebSocket auth).
@@ -287,13 +297,7 @@ pub async fn auth(
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
 
     // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
+    let query_auth = query_token.map(&matches_any);
 
     // Accept if either auth method matches
     if header_auth == Some(true) || query_auth == Some(true) {
@@ -454,10 +458,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_version_header_is_added_to_unauthorized_responses() {
+        let _api_key_state = std::sync::Arc::new(tokio::sync::RwLock::new("secret".to_string()));
         let app = Router::new()
             .route("/api/private", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn_with_state(
-                "secret".to_string(),
+                std::sync::Arc::new(tokio::sync::RwLock::new("secret".to_string())),
                 auth,
             ))
             .layer(axum::middleware::from_fn(api_version_headers));

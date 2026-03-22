@@ -8,6 +8,24 @@ use std::sync::Arc;
 
 use super::AppState;
 
+/// Build routes for the context engine plugin domain.
+pub fn router() -> axum::Router<Arc<AppState>> {
+    axum::Router::new()
+        .route(
+            "/plugins/registries",
+            axum::routing::get(list_plugin_registries),
+        )
+        .route("/plugins", axum::routing::get(list_plugins))
+        .route("/plugins/install", axum::routing::post(install_plugin))
+        .route("/plugins/uninstall", axum::routing::post(uninstall_plugin))
+        .route("/plugins/scaffold", axum::routing::post(scaffold_plugin))
+        .route("/plugins/{name}", axum::routing::get(get_plugin))
+        .route(
+            "/plugins/{name}/install-deps",
+            axum::routing::post(install_plugin_deps),
+        )
+}
+
 /// GET /api/plugins — List all installed context engine plugins.
 #[utoipa::path(
     get,
@@ -299,10 +317,15 @@ pub async fn install_plugin_deps(Path(name): Path<String>) -> impl IntoResponse 
 )]
 pub async fn list_plugin_registries(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Ensure the official registry is always present.
-    let mut registries = state.kernel.config.context_engine.plugin_registries.clone();
+    let mut registries = state
+        .kernel
+        .config_ref()
+        .context_engine
+        .plugin_registries
+        .clone();
 
     // Merge registries from [plugins].plugin_registries (URL strings treated as github repos)
-    for url in &state.kernel.config.plugins.plugin_registries {
+    for url in &state.kernel.config_ref().plugins.plugin_registries {
         if !registries.iter().any(|r| r.github_repo == *url) {
             registries.push(librefang_types::config::PluginRegistrySource {
                 name: url.clone(),
