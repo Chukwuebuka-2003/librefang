@@ -19,6 +19,7 @@ pub mod channels;
 pub mod config;
 pub mod goals;
 pub mod inbox;
+pub mod media;
 pub mod memory;
 pub mod network;
 pub mod plugins;
@@ -43,6 +44,7 @@ pub use channels::*;
 pub use config::*;
 pub use goals::*;
 pub use inbox::*;
+pub use media::*;
 pub use memory::*;
 pub use network::*;
 pub use plugins::*;
@@ -109,6 +111,8 @@ pub struct AppState {
     /// Maps token string -> SessionToken (with creation timestamp for expiry checks).
     pub active_sessions:
         Arc<tokio::sync::RwLock<HashMap<String, crate::password_hash::SessionToken>>>,
+    /// Media generation driver cache for image/TTS/video/music.
+    pub media_drivers: librefang_runtime::media::MediaDriverCache,
     /// Prometheus metrics handle (only set when `telemetry` feature + config enabled).
     #[cfg(feature = "telemetry")]
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
