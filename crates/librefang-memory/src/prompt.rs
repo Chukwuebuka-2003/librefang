@@ -23,6 +23,19 @@ impl PromptStore {
         Self { conn }
     }
 
+    /// Create a new PromptStore with its own dedicated connection.
+    /// This avoids sharing a connection with UsageStore, preventing potential
+    /// conflicts during concurrent writes.
+    pub fn new_with_path<P: AsRef<std::path::Path>>(db_path: P) -> LibreFangResult<Self> {
+        let conn =
+            Connection::open(db_path).map_err(|e| LibreFangError::Internal(e.to_string()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|e| LibreFangError::Internal(e.to_string()))?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
     pub fn create_version(&self, version: PromptVersion) -> LibreFangResult<()> {
         let conn = self
             .conn

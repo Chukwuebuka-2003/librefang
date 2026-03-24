@@ -1410,8 +1410,10 @@ impl LibreFangKernel {
             librefang_memory::usage::UsageStore::new(memory.usage_conn()),
         )));
 
-        // Initialize prompt versioning and A/B experiment store
-        let prompt_store = librefang_memory::PromptStore::new(memory.usage_conn());
+        // Initialize prompt versioning and A/B experiment store with its own connection
+        // to avoid conflicts with UsageStore concurrent writes
+        let prompt_store = librefang_memory::PromptStore::new_with_path(&db_path)
+            .map_err(|e| KernelError::BootFailed(format!("Prompt store init failed: {e}")))?;
 
         let supervisor = Supervisor::new();
         let background = BackgroundExecutor::new(supervisor.subscribe());
