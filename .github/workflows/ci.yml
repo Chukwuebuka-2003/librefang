@@ -41,6 +41,8 @@ jobs:
             patchelf
       - name: Check formatting
         run: cargo xtask fmt
+      - name: Ensure dashboard build dir exists
+        run: mkdir -p crates/librefang-api/static/react
       - name: Run clippy
         run: cargo xtask ci --no-test --no-web
 
@@ -121,6 +123,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-windows-${{ hashFiles('**/Cargo.lock') }}
+      - name: Ensure dashboard build dir exists
+        run: mkdir -p crates/librefang-api/static/react
+        shell: bash
       - run: cargo test --workspace
 
   test-macos:
@@ -133,6 +138,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-macos-${{ hashFiles('**/Cargo.lock') }}
+      - name: Ensure dashboard build dir exists
+        run: mkdir -p crates/librefang-api/static/react
       - run: cargo test --workspace
 
   test-ubuntu:
@@ -145,6 +152,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-ubuntu-${{ hashFiles('**/Cargo.lock') }}
+      - name: Ensure dashboard build dir exists
+        run: mkdir -p crates/librefang-api/static/react
       - name: Install Tauri system deps
         run: |
           sudo apt-get update
@@ -154,4 +163,28 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
-      - run: cargo test --workspace
+      - name: Build tests
+        run: cargo test --workspace --no-run
+      - name: Run tests per crate
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          for crate in \
+            librefang-types \
+            librefang-wire \
+            librefang-telemetry \
+            librefang-memory \
+            librefang-channels \
+            librefang-skills \
+            librefang-hands \
+            librefang-extensions \
+            librefang-kernel \
+            librefang-api \
+            librefang-runtime \
+            librefang-migrate \
+            librefang-testing \
+            xtask; do
+            echo "::group::Testing $crate"
+            cargo test -p "$crate" && echo "✓ $crate" || exit 1
+            echo "::endgroup::"
+          done

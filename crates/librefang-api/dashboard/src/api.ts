@@ -31,6 +31,7 @@ export interface VersionResponse {
   rust_version?: string;
   platform?: string;
   arch?: string;
+  hostname?: string;
 }
 
 export interface ProviderItem {
@@ -372,6 +373,11 @@ export interface MemoryItem {
   category?: string | null;
   metadata?: Record<string, unknown>;
   created_at?: string;
+  source?: string;
+  confidence?: number;
+  accessed_at?: string;
+  access_count?: number;
+  agent_id?: string;
 }
 
 export interface MemoryListResponse {
@@ -778,11 +784,33 @@ export async function testChannel(channelName: string): Promise<ApiActionRespons
 }
 
 export async function configureChannel(channelName: string, config: Record<string, unknown>): Promise<ApiActionResponse> {
-  return post<ApiActionResponse>(`/api/channels/${encodeURIComponent(channelName)}/configure`, config);
+  return post<ApiActionResponse>(`/api/channels/${encodeURIComponent(channelName)}/configure`, { fields: config });
 }
 
 export async function reloadChannels(): Promise<ApiActionResponse> {
   return post<ApiActionResponse>("/api/channels/reload", {});
+}
+
+export interface QrStartResponse {
+  available: boolean;
+  qr_code?: string;
+  qr_url?: string;
+  message?: string;
+}
+
+export interface QrStatusResponse {
+  connected: boolean;
+  expired: boolean;
+  message?: string;
+  bot_token?: string;
+}
+
+export async function wechatQrStart(): Promise<QrStartResponse> {
+  return post<QrStartResponse>("/api/channels/wechat/qr/start", {});
+}
+
+export async function wechatQrStatus(qrCode: string): Promise<QrStatusResponse> {
+  return get<QrStatusResponse>(`/api/channels/wechat/qr/status?qr_code=${encodeURIComponent(qrCode)}`);
 }
 
 export async function listSkills(): Promise<SkillItem[]> {
@@ -886,6 +914,11 @@ export interface TemplateParameter {
   required?: boolean;
 }
 
+export interface TemplateI18n {
+  name?: string;
+  description?: string;
+}
+
 export interface WorkflowTemplate {
   id: string;
   name: string;
@@ -894,6 +927,7 @@ export interface WorkflowTemplate {
   tags?: string[];
   parameters?: TemplateParameter[];
   steps?: WorkflowStep[];
+  i18n?: Record<string, TemplateI18n>;
 }
 
 export async function listWorkflowTemplates(q?: string, category?: string): Promise<WorkflowTemplate[]> {
@@ -914,7 +948,8 @@ export async function instantiateTemplate(id: string, params: Record<string, unk
 }
 
 export async function listWorkflows(): Promise<WorkflowItem[]> {
-  return get<WorkflowItem[]>("/api/workflows");
+  const data = await get<{ workflows?: WorkflowItem[] }>("/api/workflows");
+  return data.workflows ?? [];
 }
 
 export async function createWorkflow(payload: {
@@ -977,8 +1012,9 @@ export async function listSchedules(): Promise<ScheduleItem[]> {
 export async function createSchedule(payload: {
   name: string;
   cron: string;
-  agent_id: string;
-  message: string;
+  agent_id?: string;
+  workflow_id?: string;
+  message?: string;
   enabled?: boolean;
 }): Promise<ScheduleItem> {
   return post<ScheduleItem>("/api/schedules", payload);
@@ -1032,6 +1068,124 @@ export async function getVersionInfo(): Promise<VersionResponse> {
 
 export async function getQueueStatus(): Promise<QueueStatusResponse> {
   return get<QueueStatusResponse>("/api/queue/status");
+}
+
+export async function shutdownServer(): Promise<{ status: string }> {
+  return post<{ status: string }>("/api/shutdown", {});
+}
+
+export async function reloadConfig(): Promise<{ status: string; restart_required?: boolean; restart_reasons?: string[] }> {
+  return post<{ status: string; restart_required?: boolean; restart_reasons?: string[] }>("/api/config/reload", {});
+}
+
+export interface HealthDetailResponse {
+  status?: string;
+  version?: string;
+  uptime_seconds?: number;
+  panic_count?: number;
+  restart_count?: number;
+  agent_count?: number;
+  database?: string;
+  memory?: {
+    embedding_available?: boolean;
+    embedding_provider?: string;
+    embedding_model?: string;
+    proactive_memory_enabled?: boolean;
+    extraction_model?: string;
+  };
+  config_warnings?: string[];
+}
+
+export interface SecurityStatusResponse {
+  core_protections?: Record<string, boolean>;
+  configurable?: {
+    rate_limiter?: { enabled?: boolean; tokens_per_minute?: number; algorithm?: string };
+    websocket_limits?: { max_per_ip?: number; idle_timeout_secs?: number; max_message_size?: number; max_messages_per_minute?: number };
+    wasm_sandbox?: { fuel_metering?: boolean; epoch_interruption?: boolean; default_timeout_secs?: number; default_fuel_limit?: number };
+    auth?: { mode?: string; api_key_set?: boolean };
+  };
+  monitoring?: {
+    audit_trail?: { enabled?: boolean; algorithm?: string; entry_count?: number };
+    taint_tracking?: { enabled?: boolean; tracked_labels?: string[] };
+    manifest_signing?: { algorithm?: string; available?: boolean };
+  };
+  secret_zeroization?: boolean;
+  total_features?: number;
+}
+
+export interface BackupItem {
+  filename?: string;
+  path?: string;
+  size_bytes?: number;
+  modified_at?: string;
+  components?: string[];
+  librefang_version?: string;
+  created_at?: string;
+}
+
+export interface TaskQueueStatusResponse {
+  total?: number;
+  pending?: number;
+  in_progress?: number;
+  completed?: number;
+  failed?: number;
+}
+
+export interface TaskQueueItem {
+  id?: string;
+  status?: string;
+  created_at?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export async function getHealthDetail(): Promise<HealthDetailResponse> {
+  return get<HealthDetailResponse>("/api/health/detail");
+}
+
+export async function getSecurityStatus(): Promise<SecurityStatusResponse> {
+  return get<SecurityStatusResponse>("/api/security");
+}
+
+export async function getFullConfig(): Promise<Record<string, unknown>> {
+  return get<Record<string, unknown>>("/api/config");
+}
+
+export async function listBackups(): Promise<{ backups?: BackupItem[]; total?: number }> {
+  return get<{ backups?: BackupItem[]; total?: number }>("/api/backups");
+}
+
+export async function createBackup(): Promise<{ filename?: string; path?: string; size_bytes?: number; components?: string[]; created_at?: string }> {
+  return post<{ filename?: string; path?: string; size_bytes?: number; components?: string[]; created_at?: string }>("/api/backup", {});
+}
+
+export async function restoreBackup(filename: string): Promise<{ restored_files?: number; errors?: string[]; message?: string }> {
+  return post<{ restored_files?: number; errors?: string[]; message?: string }>("/api/restore", { filename });
+}
+
+export async function deleteBackup(filename: string): Promise<{ deleted?: string }> {
+  return del<{ deleted?: string }>(`/api/backups/${encodeURIComponent(filename)}`);
+}
+
+export async function getTaskQueueStatus(): Promise<TaskQueueStatusResponse> {
+  return get<TaskQueueStatusResponse>("/api/tasks/status");
+}
+
+export async function listTaskQueue(status?: string): Promise<{ tasks?: TaskQueueItem[]; total?: number }> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+  return get<{ tasks?: TaskQueueItem[]; total?: number }>(`/api/tasks/list${qs}`);
+}
+
+export async function deleteTaskFromQueue(id: string): Promise<{ status?: string; id?: string }> {
+  return del<{ status?: string; id?: string }>(`/api/tasks/${encodeURIComponent(id)}`);
+}
+
+export async function retryTask(id: string): Promise<{ status?: string; id?: string }> {
+  return post<{ status?: string; id?: string }>(`/api/tasks/${encodeURIComponent(id)}/retry`, {});
+}
+
+export async function cleanupSessions(): Promise<{ sessions_deleted?: number }> {
+  return post<{ sessions_deleted?: number }>("/api/sessions/cleanup", {});
 }
 
 export async function listAuditRecent(limit = 200): Promise<AuditRecentResponse> {
@@ -1370,6 +1524,19 @@ export async function getHandInstanceStatus(instanceId: string): Promise<HandIns
 export async function listGoals(): Promise<GoalItem[]> {
   const data = await get<{ goals?: GoalItem[]; total?: number }>("/api/goals");
   return data.goals ?? [];
+}
+
+export interface GoalTemplate {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  goals: { title: string; description: string; status: string }[];
+}
+
+export async function listGoalTemplates(): Promise<GoalTemplate[]> {
+  const data = await get<{ templates?: GoalTemplate[] }>("/api/goals/templates");
+  return data.templates ?? [];
 }
 
 export async function createGoal(payload: {
