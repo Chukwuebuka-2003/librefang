@@ -535,3 +535,205 @@ impl PromptStore {
         Ok(metrics)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librefang_types::agent::{ExperimentStatus, ExperimentVariant, SuccessCriteria};
+
+    fn create_test_store() -> PromptStore {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS prompt_versions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                content_hash TEXT,
+                system_prompt TEXT NOT NULL,
+                tools TEXT NOT NULL DEFAULT '[]',
+                variables TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                created_by TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                description TEXT
+            );
+            CREATE TABLE IF NOT EXISTS prompt_experiments (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '\"draft\"',
+                traffic_split TEXT NOT NULL DEFAULT '[]',
+                success_criteria TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT,
+                ended_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS experiment_variants (
+                id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                prompt_version_id TEXT NOT NULL,
+                description TEXT
+            );
+            CREATE TABLE IF NOT EXISTS experiment_metrics (
+                id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                successful_requests INTEGER NOT NULL DEFAULT 0,
+                failed_requests INTEGER NOT NULL DEFAULT 0,
+                total_latency_ms INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                last_updated TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        PromptStore::new(Arc::new(Mutex::new(conn)))
+    }
+
+    #[test]
+    fn test_create_and_list_versions() {
+        let store = create_test_store();
+        let agent_id = AgentId::new();
+
+        let version = PromptVersion {
+            id: Uuid::new_v4(),
+            agent_id,
+            version: 1,
+            content_hash: "abc123".to_string(),
+            system_prompt: "You are a helpful assistant.".to_string(),
+            tools: vec![],
+            variables: vec![],
+            created_at: Utc::now(),
+            created_by: "test".to_string(),
+            is_active: false,
+            description: Some("Test version".to_string()),
+        };
+
+        store.create_version(version.clone()).unwrap();
+
+        let versions = store.list_versions(agent_id).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, 1);
+        assert_eq!(versions[0].system_prompt, "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_set_active_version() {
+        let store = create_test_store();
+        let agent_id = AgentId::new();
+        let v1_id = Uuid::new_v4();
+        let v2_id = Uuid::new_v4();
+
+        store
+            .create_version(PromptVersion {
+                id: v1_id,
+                agent_id,
+                version: 1,
+                content_hash: "abc".to_string(),
+                system_prompt: "Version 1".to_string(),
+                tools: vec![],
+                variables: vec![],
+                created_at: Utc::now(),
+                created_by: "test".to_string(),
+                is_active: false,
+                description: None,
+            })
+            .unwrap();
+
+        store
+            .create_version(PromptVersion {
+                id: v2_id,
+                agent_id,
+                version: 2,
+                content_hash: "def".to_string(),
+                system_prompt: "Version 2".to_string(),
+                tools: vec![],
+                variables: vec![],
+                created_at: Utc::now(),
+                created_by: "test".to_string(),
+                is_active: false,
+                description: None,
+            })
+            .unwrap();
+
+        store.set_active_version(v2_id, agent_id).unwrap();
+
+        let active = store.get_active_version(agent_id).unwrap();
+        assert!(active.is_some());
+        assert_eq!(active.unwrap().version, 2);
+    }
+
+    #[test]
+    fn test_create_and_list_experiments() {
+        let store = create_test_store();
+        let agent_id = AgentId::new();
+
+        let experiment = PromptExperiment {
+            id: Uuid::new_v4(),
+            name: "Test Experiment".to_string(),
+            agent_id,
+            status: ExperimentStatus::Draft,
+            traffic_split: vec![50, 50],
+            success_criteria: SuccessCriteria {
+                require_user_helpful: false,
+                require_no_tool_errors: false,
+                require_non_empty: true,
+                custom_min_score: None,
+            },
+            started_at: None,
+            ended_at: None,
+            created_at: Utc::now(),
+            variants: vec![ExperimentVariant {
+                id: Uuid::new_v4(),
+                name: "Control".to_string(),
+                prompt_version_id: Uuid::new_v4(),
+                description: None,
+            }],
+        };
+
+        store.create_experiment(experiment.clone()).unwrap();
+
+        let experiments = store.list_experiments(agent_id).unwrap();
+        assert_eq!(experiments.len(), 1);
+        assert_eq!(experiments[0].name, "Test Experiment");
+    }
+
+    #[test]
+    fn test_get_running_experiment() {
+        let store = create_test_store();
+        let agent_id = AgentId::new();
+
+        let running_exp = PromptExperiment {
+            id: Uuid::new_v4(),
+            name: "Running Experiment".to_string(),
+            agent_id,
+            status: ExperimentStatus::Running,
+            traffic_split: vec![50, 50],
+            success_criteria: SuccessCriteria::default(),
+            started_at: Some(Utc::now()),
+            ended_at: None,
+            created_at: Utc::now(),
+            variants: vec![],
+        };
+        store.create_experiment(running_exp).unwrap();
+
+        let draft_exp = PromptExperiment {
+            id: Uuid::new_v4(),
+            name: "Draft Experiment".to_string(),
+            agent_id,
+            status: ExperimentStatus::Draft,
+            traffic_split: vec![50, 50],
+            success_criteria: SuccessCriteria::default(),
+            started_at: None,
+            ended_at: None,
+            created_at: Utc::now(),
+            variants: vec![],
+        };
+        store.create_experiment(draft_exp).unwrap();
+
+        let running = store.get_running_experiment(agent_id).unwrap();
+        assert!(running.is_some());
+        assert_eq!(running.unwrap().name, "Running Experiment");
+    }
+}
