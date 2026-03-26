@@ -120,8 +120,11 @@ enum Commands {
     )]
     Init {
         /// Quick mode: no prompts, just write config + .env (for CI/scripts).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "upgrade")]
         quick: bool,
+        /// Upgrade an existing installation: backup config, sync registry, merge new defaults.
+        #[arg(long, conflicts_with = "quick")]
+        upgrade: bool,
     },
     /// Start the LibreFang kernel daemon (API server + kernel).
     #[command(
@@ -432,8 +435,11 @@ enum Commands {
     )]
     Onboard {
         /// Quick non-interactive mode.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "upgrade")]
         quick: bool,
+        /// Upgrade an existing installation.
+        #[arg(long, conflicts_with = "quick")]
+        upgrade: bool,
     },
     /// Quick non-interactive initialization.
     #[command(
@@ -441,8 +447,11 @@ enum Commands {
     )]
     Setup {
         /// Quick mode (same as `init --quick`).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "upgrade")]
         quick: bool,
+        /// Upgrade an existing installation.
+        #[arg(long, conflicts_with = "quick")]
+        upgrade: bool,
     },
     /// Interactive setup wizard for credentials and channels.
     #[command(
@@ -1546,7 +1555,13 @@ fn main() {
             }
         }
         Some(Commands::Tui) => tui::run(cli.config),
-        Some(Commands::Init { quick }) => cmd_init(quick),
+        Some(Commands::Init { quick, upgrade }) => {
+            if upgrade {
+                cmd_init_upgrade();
+            } else {
+                cmd_init(quick);
+            }
+        }
         Some(Commands::Start {
             tail,
             foreground,
@@ -1730,7 +1745,13 @@ fn main() {
             WebhooksCommands::Delete { id } => cmd_webhooks_delete(&id),
             WebhooksCommands::Test { id } => cmd_webhooks_test(&id),
         },
-        Some(Commands::Onboard { quick }) | Some(Commands::Setup { quick }) => cmd_init(quick),
+        Some(Commands::Onboard { quick, upgrade }) | Some(Commands::Setup { quick, upgrade }) => {
+            if upgrade {
+                cmd_init_upgrade();
+            } else {
+                cmd_init(quick);
+            }
+        }
         Some(Commands::Configure) => cmd_init(false),
         Some(Commands::Message { agent, text, json }) => cmd_message(&agent, &text, json),
         Some(Commands::System(sub)) => match sub {
@@ -1875,6 +1896,13 @@ fn cmd_init(quick: bool) {
 
     let librefang_dir = cli_librefang_home();
 
+    // Hint about --upgrade when config already exists (skip in quick/CI mode)
+    if !quick && librefang_dir.join("config.toml").exists() {
+        ui::hint(
+            "Existing installation detected. To upgrade in-place, run: librefang init --upgrade",
+        );
+    }
+
     // --- Ensure directories exist ---
     if !librefang_dir.exists() {
         std::fs::create_dir_all(&librefang_dir).unwrap_or_else(|e| {
@@ -1934,6 +1962,241 @@ fn cmd_init(quick: bool) {
     }
 }
 
+/// Upgrade an existing LibreFang installation: backup config, sync registry, merge new defaults.
+fn cmd_init_upgrade() {
+    let librefang_dir = cli_librefang_home();
+    let config_path = librefang_dir.join("config.toml");
+
+    // 1. Must have an existing installation
+    if !config_path.exists() {
+        ui::error("Nothing to upgrade — no config.toml found. Run `librefang init` first.");
+        std::process::exit(1);
+    }
+
+    ui::banner();
+    ui::blank();
+    ui::section("Upgrading LibreFang installation");
+
+    // 2. Backup existing config with timestamp
+    let backup_name = format!("config.toml.bak.{}", format_local_timestamp());
+    let backup_path = librefang_dir.join(&backup_name);
+    if let Err(e) = std::fs::copy(&config_path, &backup_path) {
+        ui::error(&format!("Failed to backup config: {e}"));
+        std::process::exit(1);
+    }
+    restrict_file_permissions(&backup_path);
+    ui::success(&format!("Backed up config to {backup_name}"));
+
+    // 3. Sync registry (TTL=0 forces refresh regardless of last sync time)
+    ui::hint("Syncing registry...");
+    if librefang_runtime::registry_sync::sync_registry(&librefang_dir, 0) {
+        ui::success("Registry synced");
+    } else {
+        ui::hint("Registry sync failed (network issue?) — continuing with cached content");
+    }
+
+    // 4. Ensure data dir, vault, and git exist
+    let data_dir = librefang_dir.join("data");
+    if !data_dir.exists() {
+        let _ = std::fs::create_dir_all(&data_dir);
+    }
+    init_vault_if_missing(&librefang_dir);
+    init_git_if_missing(&librefang_dir);
+
+    // Ensure .gitignore excludes backup files (may be missing in older installations)
+    let gitignore = librefang_dir.join(".gitignore");
+    if gitignore.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gitignore) {
+            if !content.contains("*.bak.*") {
+                let _ = std::fs::write(&gitignore, format!("{content}*.bak.*\n"));
+            }
+        }
+    }
+
+    // 5. Merge new default config fields
+    let existing_raw = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            ui::error(&format!("Failed to read config.toml: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    let existing: toml::Value = match existing_raw.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            ui::error(&format!("Failed to parse config.toml: {e}"));
+            ui::hint(&format!("Your original config was saved to {backup_name}"));
+            std::process::exit(1);
+        }
+    };
+
+    let (provider, api_key_env, model) = detect_best_provider();
+    let default_config_str = render_init_default_config(&provider, &model, &api_key_env);
+    let defaults: toml::Value = match default_config_str.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            ui::error(&format!("Failed to parse default config template: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    // Find top-level keys/sections missing from user config and append them
+    // as TOML fragments. This preserves the original file's comments and formatting.
+    let added = find_missing_toplevel_keys(&existing, &defaults);
+
+    if added.is_empty() {
+        ui::success("Config is already up to date — no new fields added");
+    } else {
+        // Build TOML snippets for each missing key and append to existing file
+        let mut appendix =
+            String::from("\n# ── Added by upgrade ────────────────────────────────────\n");
+        for key in &added {
+            if let Some(val) = defaults.get(key) {
+                // Serialize just this key as a standalone TOML fragment
+                let mut fragment = toml::map::Map::new();
+                fragment.insert(key.clone(), val.clone());
+                if let Ok(snippet) = toml::to_string_pretty(&toml::Value::Table(fragment)) {
+                    appendix.push('\n');
+                    appendix.push_str(&snippet);
+                }
+            }
+        }
+        let mut content = existing_raw.clone();
+        content.push_str(&appendix);
+        if let Err(e) = std::fs::write(&config_path, &content) {
+            ui::error(&format!("Failed to write config: {e}"));
+            ui::hint(&format!("Your original config was saved to {backup_name}"));
+            std::process::exit(1);
+        }
+        restrict_file_permissions(&config_path);
+        ui::success(&format!("Added {} new config section(s):", added.len()));
+        for key in &added {
+            ui::kv("  +", key);
+        }
+    }
+
+    // 6. Check for legacy ~/.openclaw installation
+    if let Some(home) = dirs::home_dir() {
+        let openclaw_dir = home.join(".openclaw");
+        if openclaw_dir.exists() {
+            ui::blank();
+            ui::hint("Legacy ~/.openclaw installation detected.");
+            ui::hint("Run `librefang migrate --from openclaw` to migrate your data.");
+        }
+    }
+
+    // 7. Summary
+    ui::blank();
+    ui::success("Upgrade complete!");
+    ui::kv("Backup", &backup_name);
+    if !added.is_empty() {
+        ui::kv("New fields", &added.len().to_string());
+    }
+    ui::blank();
+}
+
+/// Generate a local timestamp string in YYYYMMDD-HHMMSS format without external deps.
+fn format_local_timestamp() -> String {
+    // Use libc to get local time on unix; fallback to UTC seconds on other platforms.
+    #[cfg(unix)]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: localtime_r is thread-safe and writes into our stack buffer.
+        unsafe { libc::localtime_r(&secs, &mut tm) };
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Fallback: use UTC (acceptable on Windows where libc tm isn't available)
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Simple UTC breakdown
+        let days = secs / 86400;
+        let day_secs = secs % 86400;
+        let hour = day_secs / 3600;
+        let min = (day_secs % 3600) / 60;
+        let sec = day_secs % 60;
+        // Days since 1970-01-01
+        let (year, month, day) = days_to_ymd(days);
+        format!("{year:04}{month:02}{day:02}-{hour:02}{min:02}{sec:02}")
+    }
+}
+
+/// Convert days since Unix epoch to (year, month, day). Used only on non-Unix platforms.
+#[cfg(not(unix))]
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
+#[cfg(not(unix))]
+fn is_leap(y: u64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// Find top-level keys in `defaults` that are missing from `existing`.
+/// Only checks top-level — does not recurse into sub-tables to avoid
+/// injecting partial sections the user intentionally omitted.
+fn find_missing_toplevel_keys(existing: &toml::Value, defaults: &toml::Value) -> Vec<String> {
+    let (Some(existing_table), Some(defaults_table)) = (existing.as_table(), defaults.as_table())
+    else {
+        return Vec::new();
+    };
+    defaults_table
+        .keys()
+        .filter(|k| !existing_table.contains_key(*k))
+        .cloned()
+        .collect()
+}
+
 /// Initialize vault if it doesn't exist yet (silent no-op if already initialized).
 fn init_vault_if_missing(librefang_dir: &std::path::Path) {
     let vault_path = librefang_dir.join("vault.enc");
@@ -1972,7 +2235,7 @@ fn init_git_if_missing(librefang_dir: &std::path::Path) {
     if !gitignore.exists() {
         let _ = std::fs::write(
             &gitignore,
-            "secrets.env\nvault.enc\ndaemon.json\nlogs/\ncache/\nregistry/\ndata/\n*.db\n*.db-shm\n*.db-wal\n",
+            "secrets.env\nvault.enc\ndaemon.json\nlogs/\ncache/\nregistry/\ndata/\n*.db\n*.db-shm\n*.db-wal\n*.bak.*\n",
         );
     }
 
