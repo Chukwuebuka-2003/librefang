@@ -2,30 +2,37 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDate } from "../lib/datetime";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { listSkills, uninstallSkill, clawhubSearch, clawhubInstall, clawhubGetSkill, skillhubSearch, skillhubBrowse, skillhubInstall, skillhubGetSkill, type ClawHubBrowseItem } from "../api";
-import { PageHeader } from "../components/ui/PageHeader";
+import { listSkills, uninstallSkill, clawhubSearch, clawhubInstall, clawhubGetSkill, skillhubSearch, skillhubBrowse, skillhubInstall, skillhubGetSkill, fanghubListSkills, installSkill, type ClawHubBrowseItem, type FangHubSkill } from "../api";
 import { CardSkeleton } from "../components/ui/Skeleton";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Badge } from "../components/ui/Badge";
 import { Input } from "../components/ui/Input";
-import { Pagination } from "../components/ui/Pagination";
 import { useUIStore } from "../lib/store";
 import {
   Wrench, Search, CheckCircle2, X,
   Download, Trash2, Star, Loader2, Sparkles, Package,
   Code, GitBranch, Globe, Cloud, Monitor, Bot, Database,
-  Briefcase, Shield, Terminal, Calendar, Store
+  Briefcase, Shield, Terminal, Calendar, Store, Zap, RefreshCw,
 } from "lucide-react";
 
 type ClawHubSkillWithStatus = ClawHubBrowseItem & { is_installed?: boolean };
 
 const REFRESH_MS = 30000;
-const ITEMS_PER_PAGE = 6;
 
-type ViewMode = "installed" | "marketplace" | "skillhub";
+type ViewMode = "installed" | "marketplace" | "skillhub" | "fanghub";
 type MarketplaceSource = "clawhub" | "skillhub";
+
+// Timezone-based routing: CN users see SkillHub, others see ClawHub
+const CN_TIMEZONES = new Set([
+  "Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin",
+  "Asia/Urumqi", "Asia/Kashgar",
+]);
+const USE_SKILLHUB = (() => {
+  try { return CN_TIMEZONES.has(Intl.DateTimeFormat().resolvedOptions().timeZone); }
+  catch { return false; }
+})();
 
 // Categories with icons and search keywords
 const categories = [
@@ -55,6 +62,53 @@ function getCategoryIcon(category: string) {
     cli: <Terminal className="w-4 h-4" />,
   };
   return icons[category] || <Sparkles className="w-4 h-4" />;
+}
+
+// Skill Card - FangHub registry skill
+function FangHubSkillCard({ skill, pendingId, onInstall, t }: {
+  skill: FangHubSkill;
+  pendingId: string | null;
+  onInstall: (name: string) => void;
+  t: (key: string) => string;
+}) {
+  const isPending = pendingId === skill.name;
+  return (
+    <Card hover padding="none" className="flex flex-col overflow-hidden">
+      <div className="h-1.5 bg-gradient-to-r from-brand via-brand/60 to-brand/30" />
+      <div className="p-5 flex-1 flex flex-col">
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-lg flex items-center justify-center bg-gradient-to-br from-brand/10 to-brand/5 border border-brand/20">
+              <Zap className="w-5 h-5 text-brand" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="font-bold text-sm truncate">{skill.name}</h3>
+              {skill.version && (
+                <span className="text-[10px] text-text-dim font-mono">{skill.version}</span>
+              )}
+            </div>
+          </div>
+          {skill.is_installed ? (
+            <Badge variant="success"><CheckCircle2 className="w-3 h-3 mr-1" />{t("skills.installed")}</Badge>
+          ) : (
+            <Button variant="primary" size="sm" onClick={() => onInstall(skill.name)} disabled={!!pendingId}>
+              {isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+            </Button>
+          )}
+        </div>
+        {skill.description && (
+          <p className="text-xs text-text-dim line-clamp-2 mb-3">{skill.description}</p>
+        )}
+        {skill.tags && skill.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1 mt-auto">
+            {skill.tags.slice(0, 3).map(tag => (
+              <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded-full bg-brand/8 text-brand/70 font-medium">{tag}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
 }
 
 // Skill Card - Installed
@@ -289,12 +343,11 @@ export function SkillsPage() {
   const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
 
-  // View state
-  const [viewMode, setViewMode] = useState<ViewMode>("marketplace");
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(categories[0]?.id || null);
+  // View state — default to the region-appropriate marketplace
+  const [viewMode, setViewMode] = useState<ViewMode>("fanghub");
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [skillhubSearch_, setSkillhubSearch] = useState("");
-  const [page, setPage] = useState(1);
 
   // Actions
   const [uninstalling, setUninstalling] = useState<string | null>(null);
@@ -318,25 +371,33 @@ export function SkillsPage() {
     enabled: viewMode === "marketplace" && !!searchKeyword,
   });
 
-  // Skillhub queries
+  // Skillhub queries — category selection also drives search
+  const skillhubKeyword = skillhubSearch_ || (selectedCategory ? categories.find(c => c.id === selectedCategory)?.keyword || "" : "");
+
   const skillhubBrowseQuery = useQuery({
     queryKey: ["skillhub", "browse"],
     queryFn: () => skillhubBrowse(),
     staleTime: 60000,
-    enabled: viewMode === "skillhub" && !skillhubSearch_,
+    enabled: viewMode === "skillhub" && !skillhubKeyword,
   });
 
   const skillhubSearchQuery = useQuery({
-    queryKey: ["skillhub", "search", skillhubSearch_],
-    queryFn: () => skillhubSearch(skillhubSearch_),
+    queryKey: ["skillhub", "search", skillhubKeyword],
+    queryFn: () => skillhubSearch(skillhubKeyword),
     staleTime: 60000,
-    enabled: viewMode === "skillhub" && !!skillhubSearch_,
+    enabled: viewMode === "skillhub" && !!skillhubKeyword,
   });
 
-  // Determine which skillhub data to use
-  const activeSkillhubQuery = skillhubSearch_ ? skillhubSearchQuery : skillhubBrowseQuery;
+  const activeSkillhubQuery = skillhubKeyword ? skillhubSearchQuery : skillhubBrowseQuery;
 
-  // Get skill detail when viewing details (choose API based on source)
+  // FangHub — official skills from local registry (~/.librefang/registry/skills)
+  const fanghubQuery = useQuery({
+    queryKey: ["fanghub", "list"],
+    queryFn: fanghubListSkills,
+    staleTime: 60000,
+    enabled: viewMode === "fanghub",
+  });
+
   const detailQuery = useQuery({
     queryKey: [detailsSource, "skill", detailsSkill?.slug],
     queryFn: () => {
@@ -348,7 +409,6 @@ export function SkillsPage() {
     enabled: !!detailsSkill?.slug,
   });
 
-  // Merge detail data with skill
   const skillWithDetails = detailQuery.data && detailsSkill
     ? {
         ...detailsSkill,
@@ -359,45 +419,49 @@ export function SkillsPage() {
 
   const installedSkills = skillsQuery.data ?? [];
   const isInstalledFromMarketplace = (slug: string, source: MarketplaceSource) =>
-    installedSkills.some(
-      (skill) => skill.source?.type === source && skill.source?.slug === slug,
-    );
+    installedSkills.some((skill) => skill.source?.type === source && skill.source?.slug === slug);
+
   const marketplaceSkills = searchQuery.data?.items ?? [];
   const isMarketplaceLoading = searchQuery.isLoading;
   const marketplaceError = searchQuery.error as any;
   const isRateLimited = marketplaceError?.message?.includes("429") || marketplaceError?.message?.includes("rate") || marketplaceError?.message?.includes("Rate limit") || marketplaceError?.status === 429;
 
-  // Skillhub derived data
+  const filteredMarketplace = useMemo(
+    () => marketplaceSkills
+      .map(s => ({ ...s, is_installed: isInstalledFromMarketplace(s.slug, "clawhub") }))
+      .filter(s => !search || s.name.toLowerCase().includes(search.toLowerCase()) || s.description?.toLowerCase().includes(search.toLowerCase())),
+    [marketplaceSkills, installedSkills, search],
+  );
   const skillhubSkills = activeSkillhubQuery.data?.items ?? [];
   const isSkillhubLoading = activeSkillhubQuery.isLoading;
   const skillhubError = activeSkillhubQuery.error as any;
   const isSkillhubRateLimited = skillhubError?.message?.includes("429") || skillhubError?.message?.includes("rate") || skillhubError?.message?.includes("Rate limit") || skillhubError?.status === 429;
 
-  // Filter & paginate ClawHub
-  const filteredMarketplace = useMemo(
-    () => marketplaceSkills
-      .map(s => ({
-        ...s,
-        is_installed: isInstalledFromMarketplace(s.slug, "clawhub")
-      }))
-      .filter(s => !search || s.name.toLowerCase().includes(search.toLowerCase()) || s.description?.toLowerCase().includes(search.toLowerCase())),
-    [marketplaceSkills, installedSkills, search],
-  );
-
-  const totalPages = Math.ceil(filteredMarketplace.length / ITEMS_PER_PAGE);
-  const paginatedMarketplace = filteredMarketplace.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE);
-
-  // Filter & paginate Skillhub
-  const filteredSkillhub = useMemo(
-    () => skillhubSkills.map(s => ({
-      ...s,
-      is_installed: isInstalledFromMarketplace(s.slug, "skillhub")
-    })),
-    [skillhubSkills, installedSkills],
-  );
-
-  const skillhubTotalPages = Math.ceil(filteredSkillhub.length / ITEMS_PER_PAGE);
-  const paginatedSkillhub = filteredSkillhub.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE);
+  const filteredSkillhub = useMemo(() => {
+    const all = skillhubSkills.map(s => ({ ...s, is_installed: isInstalledFromMarketplace(s.slug, "skillhub") }));
+    if (!selectedCategory) return all;
+    const kws = (categories.find(c => c.id === selectedCategory)?.keyword || "").toLowerCase().split(" ");
+    return all.filter(s =>
+      kws.some(kw =>
+        s.name.toLowerCase().includes(kw) ||
+        s.description?.toLowerCase().includes(kw) ||
+        s.tags?.some((tag: string) => tag.toLowerCase().includes(kw))
+      )
+    );
+  }, [skillhubSkills, installedSkills, selectedCategory]);
+  const fanghubSkills = fanghubQuery.data?.skills ?? [];
+  const filteredFanghub = useMemo(() => {
+    if (!selectedCategory) return fanghubSkills;
+    const keyword = categories.find(c => c.id === selectedCategory)?.keyword || "";
+    const kws = keyword.toLowerCase().split(" ");
+    return fanghubSkills.filter(s =>
+      kws.some(kw =>
+        s.name.toLowerCase().includes(kw) ||
+        s.description?.toLowerCase().includes(kw) ||
+        s.tags?.some(tag => tag.toLowerCase().includes(kw))
+      )
+    );
+  }, [fanghubSkills, selectedCategory]);
 
   // Mutations
   const uninstallMutation = useMutation({
@@ -434,6 +498,7 @@ export function SkillsPage() {
     retry: 0,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["fanghub", "list"] });
       addToast(t("common.success"), "success");
       setInstallingId(null);
       setDetailsSkill(null);
@@ -445,14 +510,31 @@ export function SkillsPage() {
     }
   });
 
+  const fanghubInstallMutation = useMutation({
+    mutationKey: ["install", "skill", "fanghub"],
+    mutationFn: ({ name }: { name: string }) => installSkill(name),
+    retry: 0,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["fanghub", "list"] });
+      addToast(t("common.success"), "success");
+      setInstallingId(null);
+    },
+    onError: (error: any) => {
+      const msg = error.message || t("common.error");
+      addToast(msg.includes("abort") ? t("skills.install_timeout") : msg, "error");
+      setInstallingId(null);
+    }
+  });
+
   const handleCategoryClick = (categoryId: string) => {
     if (selectedCategory === categoryId) {
-      setSelectedCategory(null); // Deselect
+      setSelectedCategory(null);
     } else {
       setSelectedCategory(categoryId);
       setSearch("");
+      setSkillhubSearch("");
     }
-    setPage(1);
   };
 
   const handleInstall = (slug: string, source: MarketplaceSource = "clawhub") => {
@@ -464,48 +546,46 @@ export function SkillsPage() {
     }
   };
 
-  const handleUninstall = (name: string) => {
-    setUninstalling(name);
-  };
-
-  const confirmUninstall = () => {
-    if (uninstalling) {
-      uninstallMutation.mutate(uninstalling);
-    }
-  };
-
+  const handleUninstall = (name: string) => setUninstalling(name);
+  const confirmUninstall = () => { if (uninstalling) uninstallMutation.mutate(uninstalling); };
   const handleViewDetails = (skill: ClawHubSkillWithStatus, source: MarketplaceSource) => {
     setDetailsSkill(skill);
     setDetailsSource(source);
   };
 
-  // Determine which queries are fetching for the header spinner
   const isAnyFetching = skillsQuery.isFetching || searchQuery.isFetching
-    || skillhubBrowseQuery.isFetching || skillhubSearchQuery.isFetching;
+    || skillhubBrowseQuery.isFetching || skillhubSearchQuery.isFetching || fanghubQuery.isFetching;
 
   return (
-    <div className="flex flex-col gap-6 transition-colors duration-300">
-      <PageHeader
-        badge={t("common.infrastructure")}
-        title={t("skills.title")}
-        subtitle={t("skills.subtitle")}
-        isFetching={isAnyFetching}
-        onRefresh={() => { void skillsQuery.refetch(); void searchQuery.refetch(); void activeSkillhubQuery.refetch(); }}
-        icon={<Wrench className="h-4 w-4" />}
-        helpText={t("skills.help")}
-        actions={
-          <div className="hidden rounded-full border border-border-subtle bg-surface px-3 py-1.5 text-[10px] font-bold uppercase text-text-dim sm:block">
-            {t("skills.installed_count", { count: installedSkills.length })}
+    <div className="flex flex-col gap-4 transition-colors duration-300">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="p-1.5 rounded-lg bg-brand/10 text-brand shrink-0"><Wrench className="h-4 w-4" /></div>
+          <div className="min-w-0">
+            <h1 className="text-base font-extrabold tracking-tight">{t("skills.title")}</h1>
+            <p className="text-[11px] text-text-dim hidden sm:block">{t("skills.subtitle")}</p>
           </div>
-        }
-      />
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="hidden sm:inline-block px-2.5 py-1 rounded-full border border-border-subtle bg-surface text-[10px] font-bold uppercase text-text-dim">
+            {t("skills.installed_count", { count: installedSkills.length })}
+          </span>
+          <button
+            className="flex h-8 items-center gap-1.5 rounded-xl border border-border-subtle bg-surface px-3 text-xs font-bold text-text-dim hover:text-brand hover:border-brand/30 transition-colors"
+            onClick={() => { void skillsQuery.refetch(); void searchQuery.refetch(); void activeSkillhubQuery.refetch(); }}
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${isAnyFetching ? "animate-spin" : ""}`} />
+            <span className="hidden sm:inline">{t("common.refresh")}</span>
+          </button>
+        </div>
+      </div>
 
       {/* View Toggle */}
       <div className="flex gap-1 p-1 bg-main/30 rounded-xl w-fit">
         <button
-          onClick={() => { setViewMode("installed"); setPage(1); setSearch(""); setSkillhubSearch(""); setSelectedCategory(null); }}
+          onClick={() => { setViewMode("installed"); setSearch(""); setSkillhubSearch(""); setSelectedCategory(null); }}
           className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
-            viewMode === "installed" ? "bg-surface text-success shadow-sm" : "text-text-dim hover:text-text-main"
+            viewMode === "installed" ? "bg-surface text-success shadow-sm" : "bg-surface-hover text-text-dim hover:text-text-main"
           }`}
         >
           <Package className="w-4 h-4" />
@@ -514,37 +594,60 @@ export function SkillsPage() {
             {installedSkills.length}
           </span>
         </button>
+
         <button
-          onClick={() => { setViewMode("marketplace"); setPage(1); setSkillhubSearch(""); setSelectedCategory(categories[0]?.id || null); }}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
-            viewMode === "marketplace" ? "bg-surface text-brand shadow-sm" : "text-text-dim hover:text-text-main"
+          onClick={() => { setViewMode("fanghub"); setSearch(""); setSkillhubSearch(""); setSelectedCategory(null); }}
+          className={`relative flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
+            viewMode === "fanghub" ? "bg-surface text-brand shadow-sm" : "bg-surface-hover text-text-dim hover:text-text-main"
           }`}
         >
-          <Sparkles className="w-4 h-4" />
-          {t("skills.marketplace")}
+          <Zap className="w-4 h-4" />
+          {t("skills.builtin")}
+          <span className={`absolute top-0.5 right-1 text-[8px] font-black px-1 py-px rounded-full leading-none ${viewMode === "fanghub" ? "bg-brand text-white" : "bg-border-subtle text-text-dim"}`}>{t("skills.official")}</span>
         </button>
-        <button
-          onClick={() => { setViewMode("skillhub"); setPage(1); setSearch(""); setSelectedCategory(null); }}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
-            viewMode === "skillhub" ? "bg-surface text-accent shadow-sm" : "text-text-dim hover:text-text-main"
-          }`}
-        >
-          <Store className="w-4 h-4" />
-          {t("skills.skillhub")}
-        </button>
+
+        {!USE_SKILLHUB && (
+          <button
+            onClick={() => { setViewMode("marketplace"); setSkillhubSearch(""); setSelectedCategory(null); }}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
+              viewMode === "marketplace" ? "bg-surface text-brand shadow-sm" : "bg-surface-hover text-text-dim hover:text-text-main"
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            {t("skills.marketplace")}
+          </button>
+        )}
+
+        {USE_SKILLHUB && (
+          <button
+            onClick={() => { setViewMode("skillhub"); setSearch(""); setSelectedCategory(null); }}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
+              viewMode === "skillhub" ? "bg-surface text-accent shadow-sm" : "bg-surface-hover text-text-dim hover:text-text-main"
+            }`}
+          >
+            <Store className="w-4 h-4" />
+            {t("skills.skillhub")}
+          </button>
+        )}
       </div>
 
-      {/* Category Chips — ClawHub only */}
-      {viewMode === "marketplace" && (
+      {/* Category Chips */}
+      {(viewMode === "marketplace" || viewMode === "skillhub" || viewMode === "fanghub") && (
         <div className="flex flex-wrap gap-1.5 sm:gap-2">
+          <button
+            onClick={() => { setSelectedCategory(null); }}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+              !selectedCategory ? "bg-brand text-white shadow-md" : "bg-main/50 text-text-dim hover:bg-main hover:text-text-main border border-border-subtle"
+            }`}
+          >
+            {t("common.all")}
+          </button>
           {categories.map(cat => (
             <button
               key={cat.id}
               onClick={() => handleCategoryClick(cat.id)}
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
-                selectedCategory === cat.id
-                  ? "bg-brand text-white shadow-md"
-                  : "bg-main/50 text-text-dim hover:bg-main hover:text-text-main border border-border-subtle"
+                selectedCategory === cat.id ? "bg-brand text-white shadow-md" : "bg-main/50 text-text-dim hover:bg-main hover:text-text-main border border-border-subtle"
               }`}
             >
               {getCategoryIcon(cat.id)}
@@ -558,7 +661,7 @@ export function SkillsPage() {
       {viewMode === "marketplace" && (
         <Input
           value={search}
-          onChange={(e) => { setSearch(e.target.value); setSelectedCategory(null); setPage(1); }}
+          onChange={(e) => { setSearch(e.target.value); setSelectedCategory(null); }}
           placeholder={selectedCategory ? categories.find(c => c.id === selectedCategory)?.name + "..." : t("skills.search_placeholder")}
           leftIcon={<Search className="w-4 h-4" />}
           rightIcon={search ? (
@@ -573,7 +676,7 @@ export function SkillsPage() {
       {viewMode === "skillhub" && (
         <Input
           value={skillhubSearch_}
-          onChange={(e) => { setSkillhubSearch(e.target.value); setPage(1); }}
+          onChange={(e) => { setSkillhubSearch(e.target.value); }}
           placeholder={t("skills.skillhub_search_placeholder")}
           leftIcon={<Search className="w-4 h-4" />}
           rightIcon={skillhubSearch_ ? (
@@ -605,78 +708,69 @@ export function SkillsPage() {
             {[1, 2, 3, 4, 5, 6].map(i => <CardSkeleton key={i} />)}
           </div>
         ) : isRateLimited ? (
-          <EmptyState
-            title={t("skills.rate_limited")}
-            description={t("skills.rate_limited_desc")}
-            icon={<Loader2 className="h-6 w-6 animate-spin" />}
-          />
+          <EmptyState title={t("skills.rate_limited")} description={t("skills.rate_limited_desc")} icon={<Loader2 className="h-6 w-6 animate-spin" />} />
         ) : marketplaceError ? (
-          <EmptyState
-            title={t("skills.load_error")}
-            description={marketplaceError.message || t("common.error")}
-            icon={<Search className="h-6 w-6" />}
-          />
+          <EmptyState title={t("skills.load_error")} description={marketplaceError.message || t("common.error")} icon={<Search className="h-6 w-6" />} />
         ) : filteredMarketplace.length === 0 ? (
           <EmptyState title={t("skills.no_results")} icon={<Search className="h-6 w-6" />} />
         ) : (
-          <>
+          <div className="overflow-y-auto max-h-[600px] pr-1">
             <div className="grid gap-2 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
-              {paginatedMarketplace.map(s => (
-                <MarketplaceSkillCard
-                  key={s.slug}
-                  skill={s}
-                  pendingId={installingId}
+              {filteredMarketplace.map(s => (
+                <MarketplaceSkillCard key={s.slug} skill={s} pendingId={installingId}
                   onInstall={(slug) => handleInstall(slug, "clawhub")}
                   onViewDetails={(sk) => handleViewDetails(sk, "clawhub")}
-                  source="clawhub"
-                  t={t}
-                />
+                  source="clawhub" t={t} />
               ))}
             </div>
-            {totalPages > 1 && (
-              <Pagination currentPage={page} totalPages={totalPages} onPageChange={setPage} />
-            )}
-          </>
+          </div>
         )
-      ) : (
-        /* viewMode === "skillhub" */
+      ) : viewMode === "skillhub" ? (
         isSkillhubLoading ? (
           <div className="grid gap-2 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
             {[1, 2, 3, 4, 5, 6].map(i => <CardSkeleton key={i} />)}
           </div>
         ) : isSkillhubRateLimited ? (
-          <EmptyState
-            title={t("skills.rate_limited")}
-            description={t("skills.skillhub_rate_limited_desc")}
-            icon={<Loader2 className="h-6 w-6 animate-spin" />}
-          />
+          <EmptyState title={t("skills.rate_limited")} description={t("skills.skillhub_rate_limited_desc")} icon={<Loader2 className="h-6 w-6 animate-spin" />} />
         ) : skillhubError ? (
-          <EmptyState
-            title={t("skills.load_error")}
-            description={skillhubError.message || t("common.error")}
-            icon={<Search className="h-6 w-6" />}
-          />
+          <EmptyState title={t("skills.load_error")} description={skillhubError.message || t("common.error")} icon={<Search className="h-6 w-6" />} />
         ) : filteredSkillhub.length === 0 ? (
           <EmptyState title={t("skills.no_results")} icon={<Search className="h-6 w-6" />} />
         ) : (
-          <>
+          <div className="overflow-y-auto max-h-[600px] pr-1">
             <div className="grid gap-2 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
-              {paginatedSkillhub.map(s => (
-                <MarketplaceSkillCard
-                  key={s.slug}
-                  skill={s}
-                  pendingId={installingId}
+              {filteredSkillhub.map(s => (
+                <MarketplaceSkillCard key={s.slug} skill={s} pendingId={installingId}
                   onInstall={(slug) => handleInstall(slug, "skillhub")}
                   onViewDetails={(sk) => handleViewDetails(sk, "skillhub")}
-                  source="skillhub"
-                  t={t}
-                />
+                  source="skillhub" t={t} />
               ))}
             </div>
-            {skillhubTotalPages > 1 && (
-              <Pagination currentPage={page} totalPages={skillhubTotalPages} onPageChange={setPage} />
-            )}
-          </>
+          </div>
+        )
+      ) : (
+        /* viewMode === "fanghub" — official LibreFang registry skills */
+        fanghubQuery.isLoading ? (
+          <CardSkeleton count={3} />
+        ) : filteredFanghub.length === 0 ? (
+          <EmptyState title={t("skills.no_results")} icon={<Zap className="h-6 w-6" />} />
+        ) : (
+          <div className="overflow-y-auto max-h-[600px] pr-1">
+          <div className="grid gap-2 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {filteredFanghub.map((skill: FangHubSkill) => (
+              <FangHubSkillCard
+                key={skill.name}
+                skill={skill}
+                pendingId={installingId}
+                onInstall={(name) => {
+                  setInstallingId(name);
+                  fanghubInstallMutation.mutate({ name });
+                }}
+                t={t}
+              />
+            ))}
+          </div>
+          </div>
         )
       )}
 
