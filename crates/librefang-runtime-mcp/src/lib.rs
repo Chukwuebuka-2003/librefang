@@ -13,11 +13,127 @@ use librefang_types::config::{
     HttpCompatHeaderConfig, HttpCompatMethod, HttpCompatRequestMode, HttpCompatResponseMode,
     HttpCompatToolConfig,
 };
+use librefang_types::taint::{check_outbound_text_violation, TaintSink};
 use librefang_types::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Maximum JSON nesting depth the taint scanner will traverse. Anything
+/// deeper is rejected outright so a pathological payload can't blow the
+/// stack or pin CPU. 64 is well beyond any sane tool-call shape.
+const MCP_TAINT_SCAN_MAX_DEPTH: usize = 64;
+
+/// Object keys that, when present in an MCP argument tree with a
+/// non-empty string value, are treated as credential-shaped
+/// regardless of what the value looks like. Catches the common
+/// shape `{"headers": {"Authorization": "Bearer …"}}` that the
+/// value-only text heuristic misses (whitespace + scheme word).
+const MCP_SENSITIVE_KEY_NAMES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "api_key",
+    "apikey",
+    "api-key",
+    "x-api-key",
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "bearer",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "private_key",
+];
+
+fn is_sensitive_key_name(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    MCP_SENSITIVE_KEY_NAMES.iter().any(|k| lower == *k)
+}
+
+/// Walk every string leaf in a JSON argument tree and run
+/// [`check_outbound_text_violation`] against it with the
+/// `TaintSink::mcp_tool_call` sink. Returns a *redacted* rule
+/// description (JSON path + rule name) if any leaf trips the
+/// denylist, otherwise `None`.
+///
+/// IMPORTANT: the returned string must NOT contain the offending
+/// payload. It flows back to the LLM as an error and is emitted to
+/// logs — echoing the secret we just blocked would defeat the
+/// filter. We only surface the JSON path to the offending leaf.
+///
+/// Non-string leaves (numbers, bools, null) can't carry plaintext
+/// credentials in any meaningful way, so they are skipped.
+///
+/// Recursion is hard-capped at [`MCP_TAINT_SCAN_MAX_DEPTH`].
+fn scan_mcp_arguments_for_taint(value: &serde_json::Value) -> Option<String> {
+    let sink = TaintSink::mcp_tool_call();
+    fn walk(v: &serde_json::Value, sink: &TaintSink, path: &str, depth: usize) -> Option<String> {
+        if depth > MCP_TAINT_SCAN_MAX_DEPTH {
+            return Some(format!(
+                "taint violation: MCP argument tree exceeds max depth {} at '{}'",
+                MCP_TAINT_SCAN_MAX_DEPTH, path
+            ));
+        }
+        match v {
+            serde_json::Value::String(s) => {
+                // Discard the underlying violation string entirely — it
+                // may be derived from the payload — and report only the
+                // JSON path of the offending leaf.
+                if check_outbound_text_violation(s, sink).is_some() {
+                    Some(format!(
+                        "taint violation: sensitive value in MCP argument '{}' (blocked by sink '{}')",
+                        path, sink.name
+                    ))
+                } else {
+                    None
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let child = format!("{path}[{i}]");
+                    if let Some(violation) = walk(item, sink, &child, depth + 1) {
+                        return Some(violation);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Object(obj) => {
+                for (k, v) in obj {
+                    let child = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    // Credential-shaped object key with a non-empty
+                    // string value is an unambiguous outbound
+                    // credential, regardless of what the value looks
+                    // like (e.g. `"Authorization": "Bearer sk-…"`
+                    // has whitespace and wouldn't trip the text
+                    // heuristic alone).
+                    if is_sensitive_key_name(k) {
+                        if let serde_json::Value::String(s) = v {
+                            if !s.trim().is_empty() {
+                                return Some(format!(
+                                    "taint violation: sensitive MCP argument key at '{}' (blocked by sink '{}')",
+                                    child, sink.name
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(violation) = walk(v, sink, &child, depth + 1) {
+                        return Some(violation);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    walk(value, &sink, "$", 0)
+}
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -852,6 +968,27 @@ impl McpConnection {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, String> {
+        // SECURITY: best-effort taint filter before shipping arguments
+        // to an out-of-process MCP server. An LLM that has been pushed
+        // into smuggling credentials into tool-call arguments would
+        // otherwise exfiltrate them straight through this call — the
+        // MCP transport hands the JSON to whoever implements the server.
+        // Walk every string leaf in the arguments tree and refuse the
+        // call if anything trips `check_outbound_text_violation`. Non-
+        // string leaves (numbers, bools, null) can't carry plaintext
+        // credentials in any meaningful way, so they are left alone.
+        //
+        // This is still a best-effort pattern match (see
+        // `librefang_types::taint::check_outbound_text_violation` for
+        // exactly which patterns trip it) — not a full information-
+        // flow tracker. Copy-pasted obfuscation still bypasses it.
+        if let Some(violation) = scan_mcp_arguments_for_taint(arguments) {
+            // `violation` is already a redacted rule description from
+            // the scanner — do NOT concatenate the raw payload or the
+            // offending value into the error surface.
+            return Err(violation);
+        }
+
         // Resolve to an owned String immediately so the borrow of self.original_names
         // and self.config.name ends before any mutable operations below.
         let raw_name: String = self
@@ -1330,6 +1467,117 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    // ── MCP outbound taint scanning ──────────────────────────────────────
+
+    #[test]
+    fn test_scan_mcp_arguments_rejects_secret_string_leaf() {
+        let args = serde_json::json!({
+            "repo": "libre/librefang",
+            "token": "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_some());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_walks_nested_trees() {
+        let args = serde_json::json!({
+            "filter": {
+                "headers": {
+                    "Authorization": "Bearer sk-live-secret",
+                }
+            }
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_some());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_rejects_secret_inside_array() {
+        let args = serde_json::json!({
+            "env": ["PATH=/usr/bin", "api_key=sk-00000"],
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_some());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_allows_plain_strings() {
+        let args = serde_json::json!({
+            "query": "What tokens does this crate use?",
+            "limit": 10,
+            "include_drafts": false,
+            "tags": ["rust", "security"],
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_none());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_rejects_json_authorization_string_leaf() {
+        let args = serde_json::json!({
+            "body": r#"{"authorization": "Bearer sk-live-secret"}"#,
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_some());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_rejects_pii_string_leaf() {
+        let args = serde_json::json!({
+            "email": "john@example.com",
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_some());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_error_does_not_leak_secret() {
+        // The scanner must redact: the returned error string is
+        // surfaced to the LLM and to logs, and must NOT contain the
+        // exact credential payload we just blocked.
+        let secret = "ghp_SECRETabcdef0123456789SECRETabcdef0123";
+        let args = serde_json::json!({
+            "headers": { "Authorization": format!("Bearer {secret}") }
+        });
+        let err = scan_mcp_arguments_for_taint(&args).expect("must flag credential-shaped value");
+        assert!(
+            !err.contains(secret),
+            "error string leaked the blocked secret: {err}"
+        );
+        assert!(
+            !err.contains("Bearer"),
+            "error string leaked the header value: {err}"
+        );
+        // It should still identify the offending path for debugging.
+        assert!(
+            err.contains("headers.Authorization") || err.contains("Authorization"),
+            "error string should point at the offending path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_depth_cap() {
+        // Build a 200-deep nested object. The scanner must bail out
+        // at MCP_TAINT_SCAN_MAX_DEPTH rather than recursing forever.
+        let mut v = serde_json::Value::String("ok".to_string());
+        for _ in 0..200 {
+            let mut m = serde_json::Map::new();
+            m.insert("next".to_string(), v);
+            v = serde_json::Value::Object(m);
+        }
+        let err =
+            scan_mcp_arguments_for_taint(&v).expect("depth cap must reject pathological nesting");
+        assert!(
+            err.contains("max depth"),
+            "expected depth-cap error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_allows_null_and_numbers() {
+        let args = serde_json::json!({
+            "cursor": null,
+            "page": 3,
+            "rate": 1.5,
+        });
+        assert!(scan_mcp_arguments_for_taint(&args).is_none());
+    }
 
     #[test]
     fn test_mcp_tool_namespacing() {
