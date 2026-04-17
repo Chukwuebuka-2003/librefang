@@ -38,7 +38,7 @@ export function SchedulerPage() {
   const [message, setMessage] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<{ type: "schedule" | "trigger"; id: string } | null>(null);
 
-  const agentsQuery = useAgents();
+  const agentsQuery = useAgents({ includeHands: true });
   const schedulesQuery = useSchedules();
   const triggersQuery = useTriggers();
   const workflowsQuery = useWorkflows();
