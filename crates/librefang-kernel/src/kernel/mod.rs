@@ -4916,7 +4916,7 @@ system_prompt = "You are a helpful assistant."
             for (channel, platform_id) in &bindings {
                 if kernel.channel_adapters.contains_key(channel.as_str()) {
                     if let Err(e) = kernel
-                        .send_channel_message(channel, platform_id, &message, None)
+                        .send_channel_message(channel, platform_id, &message, None, None)
                         .await
                     {
                         warn!(channel = %channel, error = %e, "Failed to send owner notification");
@@ -11590,7 +11590,7 @@ async fn cron_deliver_response(
                 .memory
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
             if let Err(e) = kernel
-                .send_channel_message(channel, to, response, None)
+                .send_channel_message(channel, to, response, None, None)
                 .await
             {
                 tracing::warn!(channel = %channel, to = %to, error = %e, "Cron channel delivery failed");
@@ -11611,7 +11611,7 @@ async fn cron_deliver_response(
                             "Cron: delivering to last channel"
                         );
                         if let Err(e) = kernel
-                            .send_channel_message(channel, recipient, response, None)
+                            .send_channel_message(channel, recipient, response, None, None)
                             .await
                         {
                             tracing::warn!(channel = %channel, recipient = %recipient, error = %e, "Cron last_channel delivery failed");
@@ -11744,6 +11744,7 @@ impl LibreFangKernel {
                 &target.recipient,
                 message,
                 target.thread_id.as_deref(),
+                None,
             )
             .await
         {
@@ -12852,21 +12853,32 @@ impl KernelHandle for LibreFangKernel {
         recipient: &str,
         message: &str,
         thread_id: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<String, String> {
         let cfg = self.config.load_full();
+        let lookup_key = account_id
+            .filter(|s| !s.is_empty())
+            .map(|aid| format!("{channel}:{aid}"))
+            .unwrap_or_else(|| channel.to_string());
         let adapter = self
             .channel_adapters
-            .get(channel)
+            .get(&lookup_key)
             .ok_or_else(|| {
                 let available: Vec<String> = self
                     .channel_adapters
                     .iter()
                     .map(|e| e.key().clone())
                     .collect();
-                format!(
-                    "Channel '{}' not found. Available channels: {:?}",
-                    channel, available
-                )
+                match account_id.filter(|s| !s.is_empty()) {
+                    Some(aid) => format!(
+                        "Channel '{}' with account_id '{}' not found. Available: {:?}",
+                        channel, aid, available
+                    ),
+                    None => format!(
+                        "Channel '{}' not found. Available channels: {:?}",
+                        channel, available
+                    ),
+                }
             })?
             .clone();
 
@@ -12916,20 +12928,31 @@ impl KernelHandle for LibreFangKernel {
         caption: Option<&str>,
         filename: Option<&str>,
         thread_id: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<String, String> {
+        let lookup_key = account_id
+            .filter(|s| !s.is_empty())
+            .map(|aid| format!("{channel}:{aid}"))
+            .unwrap_or_else(|| channel.to_string());
         let adapter = self
             .channel_adapters
-            .get(channel)
+            .get(&lookup_key)
             .ok_or_else(|| {
                 let available: Vec<String> = self
                     .channel_adapters
                     .iter()
                     .map(|e| e.key().clone())
                     .collect();
-                format!(
-                    "Channel '{}' not found. Available channels: {:?}",
-                    channel, available
-                )
+                match account_id.filter(|s| !s.is_empty()) {
+                    Some(aid) => format!(
+                        "Channel '{}' with account_id '{}' not found. Available: {:?}",
+                        channel, aid, available
+                    ),
+                    None => format!(
+                        "Channel '{}' not found. Available channels: {:?}",
+                        channel, available
+                    ),
+                }
             })?
             .clone();
 
@@ -12974,6 +12997,7 @@ impl KernelHandle for LibreFangKernel {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_channel_file_data(
         &self,
         channel: &str,
@@ -12982,20 +13006,31 @@ impl KernelHandle for LibreFangKernel {
         filename: &str,
         mime_type: &str,
         thread_id: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<String, String> {
+        let lookup_key = account_id
+            .filter(|s| !s.is_empty())
+            .map(|aid| format!("{channel}:{aid}"))
+            .unwrap_or_else(|| channel.to_string());
         let adapter = self
             .channel_adapters
-            .get(channel)
+            .get(&lookup_key)
             .ok_or_else(|| {
                 let available: Vec<String> = self
                     .channel_adapters
                     .iter()
                     .map(|e| e.key().clone())
                     .collect();
-                format!(
-                    "Channel '{}' not found. Available channels: {:?}",
-                    channel, available
-                )
+                match account_id.filter(|s| !s.is_empty()) {
+                    Some(aid) => format!(
+                        "Channel '{}' with account_id '{}' not found. Available: {:?}",
+                        channel, aid, available
+                    ),
+                    None => format!(
+                        "Channel '{}' not found. Available channels: {:?}",
+                        channel, available
+                    ),
+                }
             })?
             .clone();
 
@@ -13038,11 +13073,21 @@ impl KernelHandle for LibreFangKernel {
         is_quiz: bool,
         correct_option_id: Option<u8>,
         explanation: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<(), String> {
+        let lookup_key = account_id
+            .filter(|s| !s.is_empty())
+            .map(|aid| format!("{channel}:{aid}"))
+            .unwrap_or_else(|| channel.to_string());
         let adapter = self
             .channel_adapters
-            .get(channel)
-            .ok_or_else(|| format!("Channel adapter '{channel}' not found"))?
+            .get(&lookup_key)
+            .ok_or_else(|| match account_id.filter(|s| !s.is_empty()) {
+                Some(aid) => {
+                    format!("Channel adapter '{channel}' with account_id '{aid}' not found")
+                }
+                None => format!("Channel adapter '{channel}' not found"),
+            })?
             .clone();
 
         let user = librefang_channels::types::ChannelUser {
