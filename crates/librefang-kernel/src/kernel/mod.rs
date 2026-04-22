@@ -95,6 +95,7 @@ struct CachedWorkspaceMetadata {
     bootstrap_md: Option<String>,
     identity_md: Option<String>,
     heartbeat_md: Option<String>,
+    tools_md: Option<String>,
     created_at: std::time::Instant,
 }
 
@@ -3307,8 +3308,11 @@ system_prompt = "You are a helpful assistant."
             agent_id,
         )?;
         ensure_workspace(&workspace_dir)?;
+        migrate_identity_files(&workspace_dir);
+        let resolved_workspaces =
+            ensure_named_workspaces(&cfg.effective_workspaces_dir(), &manifest.workspaces);
         if manifest.generate_identity_files {
-            generate_identity_files(&workspace_dir, &manifest);
+            generate_identity_files(&workspace_dir, &manifest, &resolved_workspaces);
         }
         manifest.workspace = Some(workspace_dir);
 
@@ -3870,6 +3874,7 @@ system_prompt = "You are a helpful assistant."
                 workspace_context: ws_meta.as_ref().and_then(|m| m.workspace_context.clone()),
                 identity_md: ws_meta.as_ref().and_then(|m| m.identity_md.clone()),
                 heartbeat_md: ws_meta.as_ref().and_then(|m| m.heartbeat_md.clone()),
+                tools_md: ws_meta.as_ref().and_then(|m| m.tools_md.clone()),
                 peer_agents,
                 current_date: Some(
                     chrono::Local::now()
@@ -4816,6 +4821,7 @@ system_prompt = "You are a helpful assistant."
             if let Err(e) = ensure_workspace(&workspace_dir) {
                 warn!(agent_id = %agent_id, "Failed to backfill workspace (streaming): {e}");
             } else {
+                migrate_identity_files(&workspace_dir);
                 manifest.workspace = Some(workspace_dir);
                 let _ = self
                     .registry
@@ -4916,6 +4922,7 @@ system_prompt = "You are a helpful assistant."
                 workspace_context: ws_meta.as_ref().and_then(|m| m.workspace_context.clone()),
                 identity_md: ws_meta.as_ref().and_then(|m| m.identity_md.clone()),
                 heartbeat_md: ws_meta.as_ref().and_then(|m| m.heartbeat_md.clone()),
+                tools_md: ws_meta.as_ref().and_then(|m| m.tools_md.clone()),
                 peer_agents,
                 current_date: Some(
                     chrono::Local::now()
@@ -6161,6 +6168,7 @@ system_prompt = "You are a helpful assistant."
             if let Err(e) = ensure_workspace(&workspace_dir) {
                 warn!(agent_id = %agent_id, "Failed to backfill workspace: {e}");
             } else {
+                migrate_identity_files(&workspace_dir);
                 manifest.workspace = Some(workspace_dir);
                 // Persist updated workspace in registry
                 let _ = self
@@ -6262,6 +6270,7 @@ system_prompt = "You are a helpful assistant."
                 workspace_context: ws_meta.as_ref().and_then(|m| m.workspace_context.clone()),
                 identity_md: ws_meta.as_ref().and_then(|m| m.identity_md.clone()),
                 heartbeat_md: ws_meta.as_ref().and_then(|m| m.heartbeat_md.clone()),
+                tools_md: ws_meta.as_ref().and_then(|m| m.tools_md.clone()),
                 peer_agents,
                 current_date: Some(
                     chrono::Local::now()
@@ -9426,7 +9435,12 @@ system_prompt = "You are a helpful assistant."
                             warn!(hand = %def.id, role = %role, error = %e, "Failed to scaffold hand workspace");
                             continue;
                         }
-                        generate_identity_files(&workspace, &agent.manifest);
+                        migrate_identity_files(&workspace);
+                        let resolved_ws = ensure_named_workspaces(
+                            &cfg.effective_workspaces_dir(),
+                            &agent.manifest.workspaces,
+                        );
+                        generate_identity_files(&workspace, &agent.manifest, &resolved_ws);
                     }
                 }
                 // Write an empty state file so subsequent boots skip this block.
@@ -12265,6 +12279,7 @@ system_prompt = "You are a helpful assistant."
             } else {
                 None
             },
+            tools_md: read_identity_file(workspace, "TOOLS.md"),
             created_at: std::time::Instant::now(),
         };
 
@@ -14631,6 +14646,31 @@ impl KernelHandle for LibreFangKernel {
             .map_err(|e| format!("Failed to save goals: {e}"))?;
 
         Ok(result)
+    }
+
+    fn readonly_workspace_prefixes(&self, agent_id: &str) -> Vec<std::path::PathBuf> {
+        let Ok(aid) = agent_id.parse::<AgentId>() else {
+            return vec![];
+        };
+        let Some(entry) = self.registry.get(aid) else {
+            return vec![];
+        };
+        if entry.manifest.workspaces.is_empty() {
+            return vec![];
+        }
+        let workspaces_root = self.config.load().effective_workspaces_dir();
+        entry
+            .manifest
+            .workspaces
+            .iter()
+            .filter(|(_, decl)| decl.mode == WorkspaceMode::ReadOnly)
+            .filter_map(|(_, decl)| {
+                if decl.path.is_absolute() || has_unsafe_relative_components(&decl.path) {
+                    return None;
+                }
+                workspaces_root.join(&decl.path).canonicalize().ok()
+            })
+            .collect()
     }
 }
 
