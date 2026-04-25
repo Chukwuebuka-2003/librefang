@@ -307,6 +307,8 @@ pub struct LibreFangKernel {
     pub(crate) event_bus: EventBus,
     /// Session lifecycle event bus (push-based pub/sub for session-scoped events).
     pub(crate) session_lifecycle_bus: Arc<crate::session_lifecycle::SessionLifecycleBus>,
+    /// Per-session stream-event hub for multi-client SSE attach.
+    pub(crate) session_stream_hub: Arc<crate::session_stream_hub::SessionStreamHub>,
     /// Agent scheduler.
     pub(crate) scheduler: AgentScheduler,
     /// Memory substrate.
@@ -477,6 +479,8 @@ pub struct LibreFangKernel {
     approval_sweep_started: AtomicBool,
     /// Idempotency guard for the task-board stuck-task sweeper (issue #2923).
     task_board_sweep_started: AtomicBool,
+    /// Idempotency guard for the session-stream-hub idle GC task.
+    session_stream_hub_gc_started: AtomicBool,
     /// Config reload barrier — write-locked during `apply_hot_actions_inner` to prevent
     /// concurrent readers from seeing a half-updated configuration (e.g. new provider
     /// URLs but old default model). Read-locked in message hot paths so multiple
@@ -1115,6 +1119,54 @@ impl LibreFangKernel {
         });
     }
 
+    /// Spawn the session-stream-hub idle GC loop.
+    ///
+    /// `SessionStreamHub` lazily creates a broadcast sender per session on
+    /// first publish or first attach. Without periodic pruning, the senders
+    /// map grows unbounded under churn (many short-lived sessions, many
+    /// reconnects). This task calls `gc_idle()` every 60s to drop entries
+    /// with zero live receivers.
+    ///
+    /// Idempotent: re-calling while already running is a no-op.
+    pub fn spawn_session_stream_hub_gc_task(self: Arc<Self>) {
+        let handle = tokio::runtime::Handle::current();
+        if self
+            .session_stream_hub_gc_started
+            .swap(true, Ordering::AcqRel)
+        {
+            debug!("Session stream hub GC task already running");
+            return;
+        }
+
+        let kernel = Arc::clone(&self);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Skip the immediate first tick — nothing to GC at boot.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let pruned = kernel.session_stream_hub.gc_idle();
+                        if pruned > 0 {
+                            tracing::debug!(pruned, "Session stream hub GC pruned idle sessions");
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            kernel
+                .session_stream_hub_gc_started
+                .store(false, Ordering::Release);
+            tracing::debug!("Session stream hub GC task stopped");
+        });
+    }
+
     /// Skill registry (RwLock — hot-reload on install/uninstall).
     #[inline]
     pub fn skill_registry_ref(
@@ -1635,6 +1687,15 @@ impl LibreFangKernel {
 }
 
 impl LibreFangKernel {
+    /// Per-session stream-event hub (multi-client SSE attach).
+    ///
+    /// API handlers use this to subscribe attaching clients to a session's
+    /// in-flight `StreamEvent` flow. Returns the shared `Arc` so subscribers
+    /// outlive any individual turn.
+    pub fn session_stream_hub(&self) -> Arc<crate::session_stream_hub::SessionStreamHub> {
+        Arc::clone(&self.session_stream_hub)
+    }
+
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
         let config = load_config(config_path);
@@ -2647,6 +2708,7 @@ impl LibreFangKernel {
             session_lifecycle_bus: Arc::new(crate::session_lifecycle::SessionLifecycleBus::new(
                 256,
             )),
+            session_stream_hub: Arc::new(crate::session_stream_hub::SessionStreamHub::new()),
             scheduler: AgentScheduler::new(),
             memory: memory.clone(),
             proactive_memory: OnceLock::new(),
@@ -2729,6 +2791,7 @@ impl LibreFangKernel {
             budget_config: std::sync::RwLock::new(initial_budget),
             approval_sweep_started: AtomicBool::new(false),
             task_board_sweep_started: AtomicBool::new(false),
+            session_stream_hub_gc_started: AtomicBool::new(false),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             checkpoint_manager: {
                 let cp_dir = checkpoint_base_dir
@@ -5017,7 +5080,12 @@ system_prompt = "You are a helpful assistant."
 
         // Non-LLM modules: execute non-streaming and emit results as stream events
         if is_wasm || is_python {
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+            // Fan out to the session hub so attached clients see the
+            // synthesized text delta + complete event for non-LLM agents too.
+            let (tx, rx) = crate::session_stream_hub::install_stream_fanout(
+                &self.session_stream_hub,
+                entry.session_id,
+            );
             let kernel_clone = Arc::clone(self);
             let message_owned = message.to_string();
             let entry_clone = entry.clone();
@@ -5184,7 +5252,10 @@ system_prompt = "You are a helpful assistant."
                 .filter(|w| *w > 0)
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        let (tx, rx) = crate::session_stream_hub::install_stream_fanout(
+            &self.session_stream_hub,
+            effective_session_id,
+        );
         let mut manifest = entry.manifest.clone();
 
         // Inject model_supports_tools for auto web search augmentation
