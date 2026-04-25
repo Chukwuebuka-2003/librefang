@@ -130,6 +130,25 @@ pub enum CronAction {
         /// a missing `wakeAgent` key are treated as "wake normally".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_check_script: Option<String>,
+        /// Pre-processing script: the agent loop runs this argv before the
+        /// scheduled prompt fires, captures stdout, and injects it into the
+        /// LLM context. Use it to split deterministic data fetching (HTTP
+        /// scrape, diff, computation) from the LLM reasoning step — saves
+        /// tokens and reduces hallucination risk.
+        ///
+        /// Distinct from the existing `pre_check_script` field: that one
+        /// gates whether the agent runs at all (via `{"wakeAgent": false}`),
+        /// this one feeds *additional context* to a normally-firing run.
+        /// Both can coexist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_script: Option<PreScript>,
+        /// Marker that, when present at the end of the agent's response,
+        /// suppresses the delivery (no Telegram message, no email, no
+        /// dashboard ping). Default is `"[SILENT]"`. Match is "last
+        /// non-empty trimmed line == marker" — strict, won't trigger if
+        /// the marker only appears mid-response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        silent_marker: Option<String>,
     },
     /// Trigger a workflow execution by ID or name.
     Workflow {
@@ -142,6 +161,187 @@ pub enum CronAction {
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// PreScript
+// ---------------------------------------------------------------------------
+
+/// Pre-processing script invocation spec.
+///
+/// `argv` is split form (no shell parsing). `argv[0]` MUST resolve
+/// to a file under `<home_dir>/scripts/` after canonicalization —
+/// the validator rejects absolute paths outside that allowlist or
+/// relative paths that escape it via `..`.
+///
+/// `cwd` defaults to the agent's workspace; relative paths in `cwd`
+/// are interpreted against the workspace root (resolved when the
+/// scheduler dispatcher launches the script in M2).
+///
+/// `env` entries are added on top of the daemon's environment.
+/// Use it to pass per-job secrets / endpoints; sensitive values
+/// should still go through `LIBREFANG_VAULT_KEY` instead of plain
+/// strings here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreScript {
+    /// Argv-split command. `argv[0]` is the executable, the rest are passed
+    /// verbatim as arguments (no shell expansion).
+    pub argv: Vec<String>,
+    /// Working directory for the spawned process. Resolved by the dispatcher
+    /// at execution time — the validator does not constrain `cwd` because
+    /// agent workspaces are not visible at config-validation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Extra environment variables layered on top of the daemon env. Empty
+    /// by default; use sparingly — prefer the vault for secrets.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// Errors returned by [`validate_pre_script`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PreScriptValidationError {
+    /// `argv` was empty — there is no command to run.
+    #[error("pre_script.argv must not be empty")]
+    EmptyArgv,
+    /// Resolved `argv[0]` canonicalized to a path outside the
+    /// `<home_dir>/scripts/` allowlist.
+    #[error(
+        "pre_script binary `{path}` is outside the scripts allowlist (must be under {home_dir})"
+    )]
+    OutsideAllowlist {
+        /// Resolved path that failed the allowlist check.
+        path: String,
+        /// The expected allowlist root (`<home_dir>/scripts`).
+        home_dir: String,
+    },
+    /// Resolved `argv[0]` does not exist on disk (canonicalize failed).
+    #[error("pre_script binary `{path}` does not exist")]
+    NotFound {
+        /// The path that could not be canonicalized.
+        path: String,
+    },
+    /// `env` contains a key from the dangerous-keys denylist (e.g.
+    /// `LD_PRELOAD`, `PATH`) that would defeat the path allowlist.
+    #[error("pre_script.env contains dangerous key `{key}` that would defeat the path allowlist")]
+    DangerousEnvKey {
+        /// The offending env key (preserved in original case for the user).
+        key: String,
+    },
+}
+
+/// Environment variable keys that, if attacker-controlled, defeat the
+/// path allowlist on `argv[0]`. Setting any of these in `PreScript.env`
+/// is rejected by `validate_pre_script`.
+///
+/// References:
+/// - `LD_PRELOAD` / `LD_LIBRARY_PATH` / `LD_AUDIT` — glibc dynamic linker
+///   inject arbitrary code into the spawned process.
+/// - `DYLD_INSERT_LIBRARIES` / `DYLD_LIBRARY_PATH` / `DYLD_FALLBACK_LIBRARY_PATH`
+///   — Darwin equivalent.
+/// - `PATH` — `argv[0]` is allowlisted but PATH-rewriting hijacks any
+///   `subprocess.Popen("subcmd")` style call inside the script.
+/// - `IFS` — POSIX shell field-splitter rewrite.
+const DANGEROUS_ENV_KEYS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "PATH",
+    "IFS",
+];
+
+/// Returns true if `key` matches one of [`DANGEROUS_ENV_KEYS`] under an
+/// ASCII case-insensitive comparison.
+///
+/// Linux/macOS env keys are case-sensitive, but the danger keys are
+/// canonical uppercase; matching case-insensitively is defence-in-depth
+/// (a subprocess might lowercase / mixed-case the key) and matches
+/// Windows env semantics where keys are case-insensitive.
+fn is_dangerous_env_key(key: &str) -> bool {
+    DANGEROUS_ENV_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
+}
+
+/// Reject any [`PreScript`] whose `env` contains a key on the
+/// dangerous-keys denylist. Path-independent: callable from contexts
+/// where the daemon home directory is not available.
+pub fn validate_pre_script_env(script: &PreScript) -> Result<(), PreScriptValidationError> {
+    for key in script.env.keys() {
+        if is_dangerous_env_key(key) {
+            return Err(PreScriptValidationError::DangerousEnvKey { key: key.clone() });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a [`PreScript`] against the home-directory allowlist.
+///
+/// `home_dir` is the daemon home (typically `~/.librefang`). The script's
+/// `argv[0]` must canonicalize to a path under `<home_dir>/scripts/`.
+/// Relative paths are joined onto `<home_dir>/scripts/` first, then
+/// canonicalized.
+///
+/// Rejects: empty argv, missing argv[0], paths that escape the scripts
+/// dir via `..`, symlinks pointing outside the allowlist (canonicalize
+/// follows symlinks). Component-level prefix comparison is used — a sibling
+/// directory like `<home_dir>/scripts-other` will not satisfy the allowlist
+/// even though its string representation shares the prefix.
+pub fn validate_pre_script(
+    script: &PreScript,
+    home_dir: &std::path::Path,
+) -> Result<(), PreScriptValidationError> {
+    // Reject dangerous env keys before touching the filesystem — fast fail and
+    // keeps the security check independent of the home directory existing.
+    validate_pre_script_env(script)?;
+
+    let argv0 = script
+        .argv
+        .first()
+        .ok_or(PreScriptValidationError::EmptyArgv)?;
+    if argv0.is_empty() {
+        return Err(PreScriptValidationError::EmptyArgv);
+    }
+
+    let scripts_root = home_dir.join("scripts");
+    let candidate = {
+        let p = std::path::Path::new(argv0);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            scripts_root.join(p)
+        }
+    };
+
+    // Canonicalize both sides so symlink targets and `..` traversal collapse
+    // to their real on-disk paths before the prefix comparison runs.
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| PreScriptValidationError::NotFound {
+            path: candidate.display().to_string(),
+        })?;
+    // The scripts root may not exist yet on a fresh install; treat that as
+    // "nothing is on the allowlist", which makes any path fail allowlist.
+    let allow_root =
+        scripts_root
+            .canonicalize()
+            .map_err(|_| PreScriptValidationError::OutsideAllowlist {
+                path: resolved.display().to_string(),
+                home_dir: scripts_root.display().to_string(),
+            })?;
+
+    // Component-level prefix check rejects e.g. `/home/X-other` vs `/home/X`.
+    if !resolved.starts_with(&allow_root) {
+        return Err(PreScriptValidationError::OutsideAllowlist {
+            path: resolved.display().to_string(),
+            home_dir: allow_root.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +483,25 @@ impl CronJob {
     /// `existing_count` is the number of jobs the owning agent already has
     /// (excluding this job if it already exists). Returns `Ok(())` or an
     /// error message describing the first validation failure.
+    ///
+    /// Forwards to [`CronJob::validate_with_home`] with `home_dir = None`,
+    /// meaning the dangerous-env-key denylist is enforced but the
+    /// `<home_dir>/scripts/` path allowlist is skipped (callers without
+    /// a daemon home directory in hand still get the security floor).
     pub fn validate(&self, existing_count: usize) -> Result<(), String> {
+        self.validate_with_home(existing_count, None)
+    }
+
+    /// Same as [`CronJob::validate`] but additionally enforces the
+    /// `<home_dir>/scripts/` path allowlist on any `pre_script.argv[0]`.
+    /// Pass the daemon home (typically `~/.librefang`) as `home_dir` from
+    /// production code paths; pass `None` only from tests or contexts
+    /// where the path check is intentionally deferred.
+    pub fn validate_with_home(
+        &self,
+        existing_count: usize,
+        home_dir: Option<&std::path::Path>,
+    ) -> Result<(), String> {
         // -- job count cap --
         if existing_count >= MAX_JOBS_PER_AGENT {
             return Err(format!(
@@ -316,7 +534,7 @@ impl CronJob {
         self.validate_schedule()?;
 
         // -- action --
-        self.validate_action()?;
+        self.validate_action(home_dir)?;
 
         // -- delivery --
         self.validate_delivery()?;
@@ -360,7 +578,7 @@ impl CronJob {
         Ok(())
     }
 
-    fn validate_action(&self) -> Result<(), String> {
+    fn validate_action(&self, home_dir: Option<&std::path::Path>) -> Result<(), String> {
         match &self.action {
             CronAction::SystemEvent { text } => {
                 if text.is_empty() {
@@ -376,6 +594,7 @@ impl CronJob {
             CronAction::AgentTurn {
                 message,
                 timeout_secs,
+                pre_script,
                 ..
             } => {
                 if message.is_empty() {
@@ -397,6 +616,15 @@ impl CronJob {
                         return Err(format!(
                             "timeout_secs too large ({t}, max {MAX_TIMEOUT_SECS})"
                         ));
+                    }
+                }
+                // pre_script: env denylist always runs; path allowlist only
+                // runs when the caller supplied a daemon home directory.
+                if let Some(ps) = pre_script {
+                    if let Some(home) = home_dir {
+                        validate_pre_script(ps, home).map_err(|e| e.to_string())?;
+                    } else {
+                        validate_pre_script_env(ps).map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -885,6 +1113,8 @@ mod tests {
             model_override: None,
             timeout_secs: None,
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("empty"), "{err}");
@@ -898,6 +1128,8 @@ mod tests {
             model_override: None,
             timeout_secs: None,
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("too long"), "{err}");
@@ -911,6 +1143,8 @@ mod tests {
             model_override: None,
             timeout_secs: Some(9),
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("too small"), "{err}");
@@ -924,6 +1158,8 @@ mod tests {
             model_override: None,
             timeout_secs: Some(601),
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("too large"), "{err}");
@@ -937,6 +1173,8 @@ mod tests {
             model_override: Some("claude-haiku-4-5-20251001".into()),
             timeout_secs: Some(10),
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         assert!(job.validate(0).is_ok());
 
@@ -945,6 +1183,8 @@ mod tests {
             model_override: None,
             timeout_secs: Some(600),
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         assert!(job.validate(0).is_ok());
     }
@@ -957,6 +1197,8 @@ mod tests {
             model_override: None,
             timeout_secs: None,
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         assert!(job.validate(0).is_ok());
     }
@@ -1086,6 +1328,8 @@ mod tests {
             model_override: None,
             timeout_secs: Some(30),
             pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
         };
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("\"kind\":\"agent_turn\""));
@@ -1420,5 +1664,357 @@ mod tests {
         let back: CronJob = serde_json::from_str(&json).unwrap();
         assert_eq!(back.delivery_targets.len(), 2);
         assert_eq!(back.delivery_targets, job.delivery_targets);
+    }
+
+    // -- PreScript validation --
+
+    /// Build a temp daemon home with `scripts/foo.sh` so the allowlist
+    /// check has a real on-disk anchor to canonicalize against.
+    fn fixture_home_with_script(name: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("tempdir");
+        let scripts = home.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script_path = scripts.join(name);
+        std::fs::write(&script_path, "#!/bin/sh\necho hello\n").unwrap();
+        // Make it executable on Unix; on Windows the perm bits are no-ops
+        // but the validator only checks path location, not the +x bit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn pre_script_validation_accepts_path_under_scripts_dir() {
+        let home = fixture_home_with_script("foo.sh");
+        let script = PreScript {
+            argv: vec!["foo.sh".into(), "--flag".into()],
+            cwd: None,
+            env: Default::default(),
+        };
+        validate_pre_script(&script, home.path()).expect("relative path under scripts/ accepted");
+
+        // Absolute path under the same root must also pass.
+        let abs = home.path().join("scripts").join("foo.sh");
+        let script_abs = PreScript {
+            argv: vec![abs.to_string_lossy().into_owned()],
+            cwd: None,
+            env: Default::default(),
+        };
+        validate_pre_script(&script_abs, home.path()).expect("absolute path under scripts/ ok");
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_outside_allowlist() {
+        let home = fixture_home_with_script("foo.sh");
+        // Pick a path that exists on every supported platform so we hit
+        // the allowlist branch rather than NotFound.
+        #[cfg(unix)]
+        let outside = "/bin/sh";
+        #[cfg(not(unix))]
+        let outside =
+            std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into());
+        let script = PreScript {
+            argv: vec![outside.to_string()],
+            cwd: None,
+            env: Default::default(),
+        };
+        match validate_pre_script(&script, home.path()) {
+            Err(PreScriptValidationError::OutsideAllowlist { .. }) => {}
+            other => panic!("expected OutsideAllowlist, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_dot_dot_escape() {
+        let home = fixture_home_with_script("foo.sh");
+        // `scripts/../foo.sh` would resolve to `<home>/foo.sh`, which is
+        // outside `<home>/scripts/`. Place a real file there to make sure
+        // the rejection comes from the allowlist check, not NotFound.
+        std::fs::write(home.path().join("escape.sh"), "#!/bin/sh\n").unwrap();
+        let script = PreScript {
+            argv: vec!["../escape.sh".into()],
+            cwd: None,
+            env: Default::default(),
+        };
+        match validate_pre_script(&script, home.path()) {
+            Err(PreScriptValidationError::OutsideAllowlist { .. }) => {}
+            other => panic!("expected OutsideAllowlist for `..` escape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_empty_argv() {
+        let home = fixture_home_with_script("foo.sh");
+        let script = PreScript {
+            argv: vec![],
+            cwd: None,
+            env: Default::default(),
+        };
+        assert_eq!(
+            validate_pre_script(&script, home.path()),
+            Err(PreScriptValidationError::EmptyArgv)
+        );
+
+        // Also reject an explicit empty string at argv[0].
+        let script2 = PreScript {
+            argv: vec![String::new()],
+            cwd: None,
+            env: Default::default(),
+        };
+        assert_eq!(
+            validate_pre_script(&script2, home.path()),
+            Err(PreScriptValidationError::EmptyArgv)
+        );
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_nonexistent_path() {
+        let home = fixture_home_with_script("foo.sh");
+        let script = PreScript {
+            argv: vec!["does-not-exist.sh".into()],
+            cwd: None,
+            env: Default::default(),
+        };
+        match validate_pre_script(&script, home.path()) {
+            Err(PreScriptValidationError::NotFound { .. }) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    // -- CronAction::AgentTurn serde compat --
+
+    #[test]
+    fn cron_action_agent_turn_serde_round_trip_with_pre_script() {
+        // Full round-trip via TOML to cover the user-facing config format,
+        // plus JSON for the persisted DashMap path.
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".into(), "bar".into());
+        let action = CronAction::AgentTurn {
+            message: "hello".into(),
+            model_override: None,
+            timeout_secs: Some(60),
+            pre_check_script: None,
+            pre_script: Some(PreScript {
+                argv: vec!["scripts/poll.sh".into(), "--once".into()],
+                cwd: Some("/tmp/work".into()),
+                env,
+            }),
+            silent_marker: Some("[QUIET]".into()),
+        };
+        let toml_str = toml::to_string(&action).unwrap();
+        let back_toml: CronAction = toml::from_str(&toml_str).unwrap();
+        let json_str = serde_json::to_string(&action).unwrap();
+        let back_json: CronAction = serde_json::from_str(&json_str).unwrap();
+        for back in [back_toml, back_json] {
+            match back {
+                CronAction::AgentTurn {
+                    pre_script: Some(ps),
+                    silent_marker: Some(sm),
+                    ..
+                } => {
+                    assert_eq!(ps.argv, vec!["scripts/poll.sh", "--once"]);
+                    assert_eq!(ps.cwd.as_deref(), Some("/tmp/work"));
+                    assert_eq!(ps.env.get("FOO").map(String::as_str), Some("bar"));
+                    assert_eq!(sm, "[QUIET]");
+                }
+                other => panic!("round-trip lost pre_script/silent_marker: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cron_action_agent_turn_serde_compat_no_pre_script() {
+        // Pre-existing config payloads (no pre_script / silent_marker keys)
+        // must still deserialize cleanly thanks to #[serde(default)].
+        let json = r#"{
+            "kind": "agent_turn",
+            "message": "hello",
+            "model_override": null,
+            "timeout_secs": null
+        }"#;
+        let back: CronAction = serde_json::from_str(json).unwrap();
+        match back {
+            CronAction::AgentTurn {
+                pre_script,
+                silent_marker,
+                ..
+            } => {
+                assert!(pre_script.is_none());
+                assert!(silent_marker.is_none());
+            }
+            other => panic!("expected AgentTurn, got {other:?}"),
+        }
+    }
+
+    // -- PreScript dangerous-env denylist (review fix for PR #3145) --
+
+    fn pre_script_with_env(home: &std::path::Path, key: &str, value: &str) -> PreScript {
+        let scripts = home.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script_path = scripts.join("safe.sh");
+        if !script_path.exists() {
+            std::fs::write(&script_path, "#!/bin/sh\n").unwrap();
+        }
+        let mut env = std::collections::HashMap::new();
+        env.insert(key.into(), value.into());
+        PreScript {
+            argv: vec!["safe.sh".into()],
+            cwd: None,
+            env,
+        }
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_ld_preload() {
+        let home = fixture_home_with_script("safe.sh");
+        let script = pre_script_with_env(home.path(), "LD_PRELOAD", "/tmp/evil.so");
+        match validate_pre_script(&script, home.path()) {
+            Err(PreScriptValidationError::DangerousEnvKey { key }) => {
+                assert_eq!(key, "LD_PRELOAD");
+            }
+            other => panic!("expected DangerousEnvKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_path_override() {
+        let home = fixture_home_with_script("safe.sh");
+        let script = pre_script_with_env(home.path(), "PATH", "/tmp/evil:/bin");
+        assert!(matches!(
+            validate_pre_script(&script, home.path()),
+            Err(PreScriptValidationError::DangerousEnvKey { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_dyld_insert() {
+        let home = fixture_home_with_script("safe.sh");
+        let script = pre_script_with_env(home.path(), "DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib");
+        assert!(matches!(
+            validate_pre_script(&script, home.path()),
+            Err(PreScriptValidationError::DangerousEnvKey { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_script_validation_rejects_dangerous_env_case_insensitive() {
+        // ASCII case-insensitive matching: `Ld_Preload` is rejected even
+        // though the canonical form is uppercase. Mirrors the Windows env
+        // semantics and defends against subprocesses that lowercase keys.
+        let home = fixture_home_with_script("safe.sh");
+        let script = pre_script_with_env(home.path(), "Ld_Preload", "/tmp/evil.so");
+        match validate_pre_script(&script, home.path()) {
+            Err(PreScriptValidationError::DangerousEnvKey { key }) => {
+                assert_eq!(key, "Ld_Preload", "original casing preserved in error");
+            }
+            other => panic!("expected DangerousEnvKey for mixed case, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_script_validation_accepts_safe_env_keys() {
+        // Arbitrary non-denylist keys must round-trip cleanly. Specifically
+        // includes names that *contain* substrings of denylist entries
+        // (`HOME_OVERRIDE` ⊃ no denylist match) to confirm we match whole
+        // keys, not substrings.
+        let home = fixture_home_with_script("safe.sh");
+        let mut env = std::collections::HashMap::new();
+        env.insert("MY_API_KEY".into(), "secret".into());
+        env.insert("HOME_OVERRIDE".into(), "/tmp/work".into());
+        env.insert("CUSTOM_LD_FLAG".into(), "x".into());
+        let script = PreScript {
+            argv: vec!["safe.sh".into()],
+            cwd: None,
+            env,
+        };
+        validate_pre_script(&script, home.path())
+            .expect("safe env keys must pass dangerous-key denylist");
+    }
+
+    #[test]
+    fn cron_job_validate_rejects_pre_script_with_dangerous_env() {
+        // End-to-end: a cron job carrying a poisoned pre_script.env is
+        // rejected at the `CronJob::validate` boundary so ill-formed
+        // payloads never reach the scheduler. Path allowlist is skipped
+        // here (home_dir = None) but the env denylist still fires.
+        let mut env = std::collections::HashMap::new();
+        env.insert("LD_PRELOAD".into(), "/tmp/evil.so".into());
+        let mut job = valid_job();
+        job.action = CronAction::AgentTurn {
+            message: "hello".into(),
+            model_override: None,
+            timeout_secs: None,
+            pre_check_script: None,
+            pre_script: Some(PreScript {
+                argv: vec!["scripts/safe.sh".into()],
+                cwd: None,
+                env,
+            }),
+            silent_marker: None,
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(
+            err.contains("LD_PRELOAD") && err.contains("dangerous"),
+            "expected dangerous-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cron_job_validate_with_home_rejects_pre_script_outside_allowlist() {
+        // Companion test: when home_dir IS provided, both env denylist and
+        // path allowlist run. A path-escape with a benign env still fails
+        // on the path check, proving the path branch is wired up.
+        let home = fixture_home_with_script("safe.sh");
+        let mut job = valid_job();
+        #[cfg(unix)]
+        let outside = "/bin/sh".to_string();
+        #[cfg(not(unix))]
+        let outside =
+            std::env::var("COMSPEC").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into());
+        job.action = CronAction::AgentTurn {
+            message: "hello".into(),
+            model_override: None,
+            timeout_secs: None,
+            pre_check_script: None,
+            pre_script: Some(PreScript {
+                argv: vec![outside],
+                cwd: None,
+                env: Default::default(),
+            }),
+            silent_marker: None,
+        };
+        let err = job.validate_with_home(0, Some(home.path())).unwrap_err();
+        assert!(
+            err.contains("allowlist"),
+            "expected allowlist error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn silent_marker_default_via_serde_skip() {
+        // `silent_marker: None` must NOT appear in serialized output so the
+        // wire shape stays identical to legacy payloads.
+        let action = CronAction::AgentTurn {
+            message: "hi".into(),
+            model_override: None,
+            timeout_secs: None,
+            pre_check_script: None,
+            pre_script: None,
+            silent_marker: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(
+            !json.contains("silent_marker"),
+            "silent_marker leaked when None: {json}"
+        );
+        assert!(
+            !json.contains("pre_script"),
+            "pre_script leaked when None: {json}"
+        );
     }
 }
