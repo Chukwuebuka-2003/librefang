@@ -2819,10 +2819,13 @@ async fn start_test_server_with_rbac_users(
         // these tests. Other RBAC layers (channel bindings, tool policy)
         // are exercised by the kernel-level tests. The authz router is
         // mounted alongside audit/budget so the effective-permissions
-        // tests can hit it through the same auth middleware.
+        // tests can hit it through the same auth middleware. The users
+        // router is mounted so M3 (#3205) policy PUT/GET tests run the
+        // full middleware stack (owner-only gate).
         .nest("/api", routes::audit::router())
         .nest("/api", routes::budget::router())
         .nest("/api", routes::authz::router())
+        .nest("/api", routes::users::router())
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
             middleware::auth,
@@ -3856,4 +3859,53 @@ async fn test_user_budget_put_unknown_user_returns_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// RBAC M3 (#3205) follow-up — `PUT /api/users/{name}/policy` rewrites the
+/// caller's authorization surface, so it must travel through the same
+/// owner-only gate as `POST /api/users` and `DELETE /api/users/{name}`.
+/// An Admin api key has to be 403'd here; otherwise an Admin could
+/// silently grant themselves `denied_tools = []` and bypass downstream
+/// per-user denials.
+#[tokio::test(flavor = "multi_thread")]
+async fn users_policy_put_owner_only() {
+    let server = start_test_server_with_rbac_users(
+        "any-key",
+        vec![
+            ("Owner1", "owner", "owner-key"),
+            ("Alice", "admin", "alice-admin-key"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{}/api/users/Alice/policy", server.base_url))
+        .header("authorization", "Bearer alice-admin-key")
+        .json(&serde_json::json!({
+            "tool_policy": { "allowed_tools": ["web_*"], "denied_tools": [] }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "Admin must be denied PUT /api/users/{{name}}/policy by the owner-only middleware gate"
+    );
+
+    let resp = client
+        .put(format!("{}/api/users/Alice/policy", server.base_url))
+        .header("authorization", "Bearer owner-key")
+        .json(&serde_json::json!({
+            "tool_policy": { "allowed_tools": ["web_*"], "denied_tools": [] }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "Owner must be allowed to upsert per-user policy"
+    );
 }
