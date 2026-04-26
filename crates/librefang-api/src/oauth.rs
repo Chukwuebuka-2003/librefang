@@ -267,11 +267,35 @@ fn verify_state_token(state: &str) -> Result<OAuthStatePayload, String> {
     Ok(payload)
 }
 
-/// Derive the HMAC signing key for state tokens. Uses LIBREFANG_STATE_SECRET
-/// env var if set, otherwise falls back to a random per-process key.
+/// Derive the HMAC signing key for state tokens.
+///
+/// Uses LIBREFANG_STATE_SECRET env var if set. If not set, generates a
+/// random 32-byte key per process. The ephemeral key is fine for single-node
+/// development but should be set explicitly in production to persist across
+/// restarts and to ensure consistent validation across load-balanced instances.
 fn state_signing_key() -> String {
     static KEY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        std::env::var("LIBREFANG_STATE_SECRET").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+        if let Some(secret) = std::env::var("LIBREFANG_STATE_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            if secret.len() < 32 {
+                tracing::warn!(
+                    "LIBREFANG_STATE_SECRET is short ({} bytes); recommend >= 32",
+                    secret.len()
+                );
+            }
+            return secret;
+        }
+        tracing::warn!(
+            "LIBREFANG_STATE_SECRET not set; using ephemeral random key. \
+             Set it to persist OAuth flows across restarts."
+        );
+        // Reuse the OsRng already available via argon2::password_hash::rand_core
+        use argon2::password_hash::rand_core::{OsRng, RngCore};
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
     });
     KEY.clone()
 }
