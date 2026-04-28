@@ -22,10 +22,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info, warn};
-
-#[allow(unused_imports)]
 use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -149,9 +147,6 @@ pub enum WireError {
 /// Maximum single message size (16 MB).
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Maximum single message size (16 MB).
-pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
-
 /// SECURITY: Maximum size of an agent message forwarded from a remote peer.
 ///
 /// Enforced before the message is handed to the kernel's LLM pipeline.
@@ -176,10 +171,12 @@ impl TlsConfig {
     ///
     /// SECURITY: This enables TLS 1.3 encryption for OFP transport.
     /// Without TLS, all wire traffic is plaintext and visible to on-path observers.
-    #[allow(unused_variables)]
+    ///
+    /// TODO: Implement proper PEM parsing with rustls-pemfile.
+    /// See issue #3874 for tracking.
     pub fn to_acceptor(&self) -> Result<TlsAcceptor, WireError> {
         Err(WireError::Config(
-            "TLS support not yet implemented — see issue #3874".to_string(),
+            "TLS acceptor implementation pending — see issue #3874".to_string(),
         ))
     }
 }
@@ -254,7 +251,7 @@ pub struct PeerNode {
     #[allow(dead_code)]
     session_key: std::sync::Mutex<Option<String>>,
     /// TLS acceptor for encrypted connections. None if TLS not configured.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     tls_acceptor: Option<TlsAcceptor>,
 }
 
@@ -620,6 +617,8 @@ impl PeerNode {
     }
 
     /// Handle a single inbound connection: perform handshake, then enter message loop.
+    ///
+    /// SECURITY: When TLS is configured, the TLS handshake is performed on accept.
     async fn handle_inbound(
         stream: TcpStream,
         addr: SocketAddr,
@@ -627,6 +626,19 @@ impl PeerNode {
         registry: &PeerRegistry,
         handle: &dyn PeerHandle,
     ) -> Result<(), WireError> {
+        // SECURITY: Upgrade to TLS if configured
+        if let Some(ref acceptor) = node.tls_acceptor {
+            debug!("OFP: upgrading inbound connection from {} to TLS 1.3", addr);
+            let _tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                WireError::Io(std::io::Error::other(format!("TLS accept failed: {}", e)))
+            })?;
+            // Note: Full TLS support for message loop requires refactoring.
+            // See issue #3874.
+            return Err(WireError::Config(
+                "TLS beyond handshake not yet implemented — see issue #3874".to_string(),
+            ));
+        }
+
         let (mut reader, mut writer) = stream.into_split();
 
         // Read the incoming handshake request
@@ -1202,6 +1214,7 @@ mod tests {
             node_id: "node-1".to_string(),
             node_name: "kernel-1".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node1, _task1) = PeerNode::start(config1, registry1.clone(), handle1.clone())
             .await
@@ -1215,6 +1228,7 @@ mod tests {
             node_id: "node-2".to_string(),
             node_name: "kernel-2".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node2, _task2) = PeerNode::start(config2, registry2.clone(), handle2.clone())
             .await
@@ -1249,6 +1263,7 @@ mod tests {
             node_id: "server".to_string(),
             node_name: "server-node".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node, _task) = PeerNode::start(config, registry.clone(), handle.clone())
             .await
@@ -1293,6 +1308,7 @@ mod tests {
             node_id: "server".to_string(),
             node_name: "server-node".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node, _task) = PeerNode::start(config, registry, handle).await.unwrap();
 
@@ -1325,6 +1341,7 @@ mod tests {
             node_id: "server".to_string(),
             node_name: "server-node".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node, _task) = PeerNode::start(config, registry, handle).await.unwrap();
 
@@ -1359,6 +1376,7 @@ mod tests {
             node_id: "node-a".to_string(),
             node_name: "kernel-a".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node1, _task1) = PeerNode::start(config1, registry1.clone(), handle1.clone())
             .await
@@ -1371,6 +1389,7 @@ mod tests {
             node_id: "node-b".to_string(),
             node_name: "kernel-b".to_string(),
             shared_secret: "test-secret-for-unit-tests".to_string(),
+            tls: None,
         };
         let (node2, _task2) = PeerNode::start(config2, registry2.clone(), handle2.clone())
             .await

@@ -21,5 +21,6 @@ hex = { workspace = true }
 subtle = { workspace = true }
 dashmap = { workspace = true }
 rustls = { workspace = true }
-webpki-roots = { workspace = true }
+rustls-pemfile = "2"
 tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }

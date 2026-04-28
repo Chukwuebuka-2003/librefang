@@ -4654,6 +4654,7 @@ dependencies = [
  "hmac",
  "librefang-types",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
