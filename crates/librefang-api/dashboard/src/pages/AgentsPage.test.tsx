@@ -2,8 +2,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AgentsPage } from "./AgentsPage";
+import { useAgentTemplates } from "../lib/queries/agents";
+import { useDashboardSnapshot } from "../lib/queries/overview";
+import { useProviders } from "../lib/queries/providers";
+import { useModels } from "../lib/queries/models";
 
-// Mock the hooks
 vi.mock("../lib/queries/agents", () => ({
   agentQueries: {
     list: () => ["agents", "list"],
@@ -93,57 +96,47 @@ describe("AgentsPage", () => {
     );
   };
 
-  it("renders loading state", () => {
-    const { useQuery } = require("@tanstack/react-query");
-    const { useAgentTemplates } = require("../lib/queries/agents");
-    const { useDashboardSnapshot } = require("../lib/queries/overview");
-    const { useProviders } = require("../lib/queries/providers");
-    const { useModels } = require("../lib/queries/models");
-
-    (useAgentTemplates as any).mockReturnValue({
+  it("renders loading state", async () => {
+    (useAgentTemplates as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
-    (useDashboardSnapshot as any).mockReturnValue({
+    (useDashboardSnapshot as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
-    (useProviders as any).mockReturnValue({
+    (useProviders as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
-    (useModels as any).mockReturnValue({
+    (useModels as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
 
     renderWithQueryClient(<AgentsPage />);
 
-    // Should render something
-    expect(document.body).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
   });
 
   it("renders with agents list", async () => {
-    const { useAgentTemplates } = require("../lib/queries/agents");
-    const { useDashboardSnapshot } = require("../lib/queries/overview");
-    const { useProviders } = require("../lib/queries/providers");
-    const { useModels } = require("../lib/queries/models");
-
-    (useAgentTemplates as any).mockReturnValue({
+    (useAgentTemplates as ReturnType<typeof vi.fn>).mockReturnValue({
       data: [],
       isLoading: false,
     });
-    (useDashboardSnapshot as any).mockReturnValue({
+    (useDashboardSnapshot as ReturnType<typeof vi.fn>).mockReturnValue({
       data: {
         status: { agent_count: 5 },
       },
       isLoading: false,
     });
-    (useProviders as any).mockReturnValue({
+    (useProviders as ReturnType<typeof vi.fn>).mockReturnValue({
       data: [],
       isLoading: false,
     });
-    (useModels as any).mockReturnValue({
+    (useModels as ReturnType<typeof vi.fn>).mockReturnValue({
       data: [],
       isLoading: false,
     });
@@ -151,7 +144,7 @@ describe("AgentsPage", () => {
     renderWithQueryClient(<AgentsPage />);
 
     await waitFor(() => {
-      expect(document.body).toBeTruthy();
+      expect(screen.getByRole("main")).toBeInTheDocument();
     });
   });
 });

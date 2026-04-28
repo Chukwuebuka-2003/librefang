@@ -5,7 +5,6 @@ import { OverviewPage } from "./OverviewPage";
 import { useDashboardSnapshot, useVersionInfo } from "../lib/queries/overview";
 import { useQuickInit } from "../lib/mutations/overview";
 
-// Mock the hooks
 vi.mock("../lib/queries/overview", () => ({
   useDashboardSnapshot: vi.fn(),
   useVersionInfo: vi.fn(),
@@ -15,12 +14,10 @@ vi.mock("../lib/mutations/overview", () => ({
   useQuickInit: vi.fn(),
 }));
 
-// Mock react-i18next
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
-// Mock @tanstack/react-router
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
 }));
@@ -47,25 +44,26 @@ describe("OverviewPage", () => {
     );
   };
 
-  it("renders loading state correctly", () => {
-    (useDashboardSnapshot as any).mockReturnValue({
+  it("renders loading state correctly", async () => {
+    (useDashboardSnapshot as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
       isError: false,
     });
-    (useVersionInfo as any).mockReturnValue({
+    (useVersionInfo as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
-    (useQuickInit as any).mockReturnValue({
+    (useQuickInit as ReturnType<typeof vi.fn>).mockReturnValue({
       mutate: vi.fn(),
       isPending: false,
     });
 
     renderWithQueryClient(<OverviewPage />);
 
-    // Should show skeleton loaders
-    expect(document.querySelector("[data-testid='skeleton']") || document.querySelector(".animate-pulse")).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
   });
 
   it("renders data correctly when loaded", async () => {
@@ -92,33 +90,31 @@ describe("OverviewPage", () => {
       commit: "abc123",
     };
 
-    (useDashboardSnapshot as any).mockReturnValue({
+    (useDashboardSnapshot as ReturnType<typeof vi.fn>).mockReturnValue({
       data: mockSnapshot,
       isLoading: false,
       isError: false,
     });
-    (useVersionInfo as any).mockReturnValue({
+    (useVersionInfo as ReturnType<typeof vi.fn>).mockReturnValue({
       data: mockVersion,
       isLoading: false,
     });
-    (useQuickInit as any).mockReturnValue({
+    (useQuickInit as ReturnType<typeof vi.fn>).mockReturnValue({
       mutate: vi.fn(),
       isPending: false,
     });
 
     renderWithQueryClient(<OverviewPage />);
 
-    // Should render version info
     await waitFor(() => {
-      expect(screen.getByText("2026.4.27")).toBeInTheDocument();
+      expect(screen.getByText(/2026\.4\.27/)).toBeInTheDocument();
     });
 
-    // Should render agent counts
-    expect(screen.getByText("5")).toBeInTheDocument();
-    expect(screen.getByText("10")).toBeInTheDocument();
+    expect(screen.getByText(/5\s+active/i)).toBeInTheDocument();
+    expect(screen.getByText(/10\s+total/i)).toBeInTheDocument();
   });
 
-  it("renders init prompt when config does not exist", () => {
+  it("renders init prompt when config does not exist", async () => {
     const mockSnapshot = {
       status: {
         active_agent_count: 0,
@@ -131,46 +127,48 @@ describe("OverviewPage", () => {
       channels: [],
     };
 
-    (useDashboardSnapshot as any).mockReturnValue({
+    (useDashboardSnapshot as ReturnType<typeof vi.fn>).mockReturnValue({
       data: mockSnapshot,
       isLoading: false,
       isError: false,
     });
-    (useVersionInfo as any).mockReturnValue({
+    (useVersionInfo as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: false,
     });
-    (useQuickInit as any).mockReturnValue({
+    (useQuickInit as ReturnType<typeof vi.fn>).mockReturnValue({
       mutate: vi.fn(),
       isPending: false,
     });
 
     renderWithQueryClient(<OverviewPage />);
 
-    // Should show init prompt
-    expect(screen.getByText(/quickInit/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /quick setup/i })).toBeInTheDocument();
+    });
   });
 
-  it("renders error state when query fails", () => {
-    (useDashboardSnapshot as any).mockReturnValue({
+  it("renders error state when query fails", async () => {
+    (useDashboardSnapshot as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: false,
       isError: true,
       error: new Error("Failed to fetch"),
     });
-    (useVersionInfo as any).mockReturnValue({
+    (useVersionInfo as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: false,
       isError: true,
     });
-    (useQuickInit as any).mockReturnValue({
+    (useQuickInit as ReturnType<typeof vi.fn>).mockReturnValue({
       mutate: vi.fn(),
       isPending: false,
     });
 
     renderWithQueryClient(<OverviewPage />);
 
-    // Should show error state or empty
-    expect(document.body.textContent).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+    });
   });
 });

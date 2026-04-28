@@ -2,8 +2,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ChatPage } from "./ChatPage";
+import { useAgents } from "../lib/queries/agents";
+import { useModels } from "../lib/queries/models";
+import { useFullConfig } from "../lib/queries/config";
 
-// Mock the hooks and API
 vi.mock("../lib/queries/agents", () => ({
   useAgents: vi.fn(),
   useAgentSessions: vi.fn(),
@@ -84,83 +86,70 @@ describe("ChatPage", () => {
     );
   };
 
-  it("renders loading state correctly", () => {
-    const { useAgents } = await import("../lib/queries/agents");
-    const { useModels } = await import("../lib/queries/models");
-    const { useFullConfig } = await import("../lib/queries/config");
-
-    (useAgents as any).mockReturnValue({
+  it("renders loading state correctly", async () => {
+    (useAgents as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
-    (useModels as any).mockReturnValue({
+    (useModels as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
-    (useFullConfig as any).mockReturnValue({
+    (useFullConfig as ReturnType<typeof vi.fn>).mockReturnValue({
       data: null,
       isLoading: true,
     });
 
     renderWithQueryClient(<ChatPage />);
 
-    // Should show loading indicator or skeleton
-    expect(document.body.textContent).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole("main")).toBeInTheDocument();
+    });
   });
 
   it("renders empty state when no agents exist", async () => {
-    const { useAgents } = await import("../lib/queries/agents");
-    const { useModels } = await import("../lib/queries/models");
-    const { useFullConfig } = await import("../lib/queries/config");
-
-    (useAgents as any).mockReturnValue({
+    (useAgents as ReturnType<typeof vi.fn>).mockReturnValue({
       data: [],
       isLoading: false,
     });
-    (useModels as any).mockReturnValue({
+    (useModels as ReturnType<typeof vi.fn>).mockReturnValue({
       data: [],
       isLoading: false,
     });
-    (useFullConfig as any).mockReturnValue({
+    (useFullConfig as ReturnType<typeof vi.fn>).mockReturnValue({
       data: {},
       isLoading: false,
     });
 
     renderWithQueryClient(<ChatPage />);
 
-    // Should render page content
     await waitFor(() => {
-      expect(document.body).toBeTruthy();
+      expect(screen.getByRole("main")).toBeInTheDocument();
     });
   });
 
   it("renders with agents data", async () => {
-    const { useAgents } = await import("../lib/queries/agents");
-    const { useModels } = await import("../lib/queries/models");
-    const { useFullConfig } = await import("../lib/queries/config");
-
     const mockAgents = [
       { id: "agent-1", name: "Test Agent", status: "active" },
     ];
 
-    (useAgents as any).mockReturnValue({
+    (useAgents as ReturnType<typeof vi.fn>).mockReturnValue({
       data: mockAgents,
       isLoading: false,
     });
-    (useModels as any).mockReturnValue({
+    (useModels as ReturnType<typeof vi.fn>).mockReturnValue({
       data: [],
       isLoading: false,
     });
-    (useFullConfig as any).mockReturnValue({
+    (useFullConfig as ReturnType<typeof vi.fn>).mockReturnValue({
       data: {},
       isLoading: false,
     });
 
     renderWithQueryClient(<ChatPage />);
 
-    // Page should render
     await waitFor(() => {
-      expect(document.body).toBeTruthy();
+      expect(screen.getByRole("main")).toBeInTheDocument();
     });
   });
 });

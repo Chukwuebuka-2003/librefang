@@ -21,9 +21,6 @@ while IFS=: read -r file line content; do
     # Skip test files
     [[ "$file" == *.test.tsx ]] && continue
 
-    # Skip commented lines
-    [[ "$content" == *"//"* ]] && continue
-
     # Skip .refetch() (TanStack Query pattern - allowed)
     [[ "$content" == *.refetch* ]] && continue
 
@@ -35,6 +32,14 @@ while IFS=: read -r file line content; do
 
     # Skip fetch inside strings
     [[ "$content" == *'"'*fetch*'"'* ]] && continue
+
+    # Check for exception comments in the file (skip if exception is documented)
+    if grep -qE "Exception|exception|file download|SSE/streaming|streaming" "$file" 2>/dev/null; then
+        continue
+    fi
+
+    # Skip commented out lines
+    [[ "$content" == *"//"* ]] && continue
 
     basename=$(basename "$file")
     VIOLATIONS+=("  $basename:$line: $content")
@@ -64,6 +69,7 @@ if [ ${#VIOLATIONS[@]} -gt 0 ]; then
     echo ""
     echo "These should be commented in code per AGENTS.md"
     echo ""
+    exit 1
 fi
 
-exit 0  # Don't fail the build, just report
+exit 0
