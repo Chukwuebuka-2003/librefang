@@ -280,34 +280,56 @@ impl ChannelAdapter for WebhookAdapter {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
 
-                        if !WebhookAdapter::verify_signature(&secret, &body, signature) {
-                            warn!("Webhook: invalid signature");
-                            return (
-                                axum::http::StatusCode::FORBIDDEN,
-                                "Forbidden: invalid signature",
-                            );
-                        }
-
-                        // Replay-attack protection: reject requests whose
-                        // X-Webhook-Timestamp is more than 5 minutes stale.
-                        if let Some(ts_header) = headers.get("X-Webhook-Timestamp") {
-                            if let Ok(ts_str) = ts_header.to_str() {
-                                if let Ok(ts_ms) = ts_str.parse::<i64>() {
-                                    let now_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as i64;
-                                    if (now_ms - ts_ms).abs() > 5 * 60 * 1000 {
-                                        warn!("Webhook: timestamp too old — possible replay attack");
-                                        return (
-                                            axum::http::StatusCode::FORBIDDEN,
-                                            "Forbidden: timestamp too old",
-                                        );
-                                    }
+                        // Route through verify_request (#3948) so sig
+                        // and timestamp/skew are one atomic check.
+                        // Pre-fix the handler open-coded both
+                        // separately and verify_request was unused
+                        // dead code.  Timestamps stay optional for
+                        // backwards compatibility — clients that
+                        // don't send X-Webhook-Timestamp keep working
+                        // with sig-only verification.
+                        // Contract: X-Webhook-Timestamp is the message creation time in
+                        // MILLISECONDS since the Unix epoch (matches the original handler's
+                        // behaviour pre-#4068; see /docs/architecture/webhook-signatures.md).
+                        // We divide by 1000 here because verify_request takes seconds.
+                        // Distinguish "header absent" (legitimate sig-only fallback) from
+                        // "header present but malformed" (attacker probing for the bypass).
+                        let ts_header = headers.get("X-Webhook-Timestamp");
+                        let ts_secs: Option<i64> = match ts_header {
+                            Some(v) => match v.to_str().ok().and_then(|s| s.parse::<i64>().ok()) {
+                                Some(ts_ms) => Some(ts_ms / 1000),
+                                None => {
+                                    warn!("Webhook: X-Webhook-Timestamp present but not a valid integer; rejecting");
+                                    return (
+                                        axum::http::StatusCode::BAD_REQUEST,
+                                        "Bad Request: invalid timestamp",
+                                    );
                                 }
-                            }
+                            },
+                            None => None,
+                        };
+                        let now_secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let verify_outcome = if ts_secs.is_some() {
+                            WebhookAdapter::verify_request(
+                                &secret, &body, signature, ts_secs, now_secs,
+                            )
                         } else {
                             warn!("Webhook: request has no X-Webhook-Timestamp — replay protection unavailable");
+                            if WebhookAdapter::verify_signature(&secret, &body, signature) {
+                                Ok(())
+                            } else {
+                                Err("invalid signature")
+                            }
+                        };
+                        if let Err(reason) = verify_outcome {
+                            warn!("Webhook: rejected — {reason}");
+                            // Collapse all auth failures to one public string — sig-vs-ts
+                            // distinction would let an attacker probe which check failed
+                            // and craft replay/forgery attacks accordingly.
+                            return (axum::http::StatusCode::FORBIDDEN, "Forbidden");
                         }
 
                         let json_body: serde_json::Value = match serde_json::from_slice(&body) {
