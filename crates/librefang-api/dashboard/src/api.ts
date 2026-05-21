@@ -116,22 +116,42 @@ export interface MediaMusicResult {
   sample_rate?: number;
 }
 
+export interface ChannelField {
+  key: string;
+  label?: string;
+  type?: string;
+  required?: boolean;
+  advanced?: boolean;
+  has_value?: boolean;
+  env_var?: string | null;
+  placeholder?: string | null;
+  value?: string;
+  options?: string[];
+  show_when?: string;
+  readonly?: boolean;
+}
+
 export interface ChannelItem {
   name: string;
   display_name?: string;
   configured?: boolean;
+  /** True iff every required secret env var on the sidecar manifest
+   *  is present and non-empty. The backend computes this per row. */
   has_token?: boolean;
   category?: string;
   description?: string;
   icon?: string;
-  /** TOML snippet shown for read-only sidecar discovery rows so operators
-   *  can copy it into config.toml. Backend always emits this; the UI only
-   *  renders it for `category === "sidecar"` to avoid noise on regular
-   *  rows that have their own configure flow. */
+  /** Schema-driven configure form for a sidecar adapter (returned by
+   *  `python -m <module> --describe` and cached daemon-side). */
+  fields?: ChannelField[];
+  /** Read-only TOML snippet the operator can copy into config.toml
+   *  if they prefer hand-editing over the configure drawer. Emitted
+   *  by the backend on every row. */
   config_template?: string;
   /** Messages exchanged through this channel in the last 24 hours.
    *  Computed via a single grouped query on `usage_events` keyed by
-   *  the `channel` column. */
+   *  the `channel` column. Surfaced as the `kind · N msgs/24h`
+   *  meta-line on the Channels page card. */
   msgs_24h?: number;
 }
 
